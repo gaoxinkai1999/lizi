@@ -8,7 +8,14 @@ import {
   LogOut,
   RefreshCw,
 } from "lucide-vue-next";
-import { request, localDate } from "./api.js";
+import { request, localDate, setWritesAllowed } from "./api.js";
+import {
+  readSession,
+  saveSession,
+  sessionScope,
+  clearReportCache,
+  getCacheWarning,
+} from "./offline-cache.js";
 import AuthView from "./components/AuthView.vue";
 import ReportsView from "./components/ReportsView.vue";
 import SettingsView from "./components/SettingsView.vue";
@@ -26,15 +33,30 @@ const status = ref(null);
 const statusError = ref("");
 const live = ref(false);
 const refreshKey = ref(0);
-let events, statusTimer, eventTimer, authTimer;
+const verified = ref(false);
+const offlineSession = ref(false);
+const scope = ref("");
+const dataRoot = ref(null);
+const initialQuery = ref(null);
+const cacheMessage = ref(getCacheWarning());
+const updateAvailable = ref(false);
+let events, statusTimer, authTimer, stateController;
 let stateSequence = 0;
 let sessionGeneration = 0;
 let statusPending = false;
+let statePending = false;
+let revision = null;
+let invalidating = false;
+let retryAt = 0;
+let failures = 0;
 const nav = computed(() => [
   { id: "reports", label: "报告", icon: FileChartColumn },
   {
     id: "settings",
-    label: user.value?.role === "admin" ? "设置" : "状态",
+    label:
+      !authenticationEnabled.value || user.value?.role === "admin"
+        ? "设置"
+        : "状态",
     icon: Settings2,
   },
   ...(authenticationEnabled.value
@@ -44,47 +66,105 @@ const nav = computed(() => [
 watch(page, () => window.scrollTo({ top: 0, behavior: "instant" }), {
   flush: "post",
 });
-async function refreshState({ reset = false, expired = false } = {}) {
-  const sequence = ++stateSequence;
-  const previousUser = user.value;
-  if (reset) {
-    stopSession();
-    ready.value = false;
-    status.value = null;
-    statusError.value = "";
-    bootError.value = "";
+function acceptRevision(value) {
+  if (value === undefined || value === null || value === revision) return;
+  revision = value;
+  refreshKey.value++;
+}
+function acceptStatus(value) {
+  if (value.root !== undefined && value.root !== dataRoot.value) {
+    invalidateSession(new Event("lizi:data-root-changed"));
+    return;
   }
+  const completed =
+    !value.scanning &&
+    (status.value?.scanning ||
+      (value.lastScan && value.lastScan !== status.value?.lastScan));
+  status.value = value;
+  statusError.value = "";
+  const oldRevision = revision;
+  acceptRevision(value.revision);
+  if (completed && oldRevision === revision) refreshKey.value++;
+}
+async function refreshState() {
+  if (statePending || invalidating || navigator.onLine === false) return;
+  statePending = true;
+  const wasVerified = verified.value;
+  const sequence = ++stateSequence;
+  stateController = new AbortController();
   try {
-    const data = await request("/auth/state");
+    const data = await request("/auth/state", {
+      signal: stateController.signal,
+      timeout: 10_000,
+      retries: 0,
+    });
+    if (sequence !== stateSequence) return;
+    const nextScope = await sessionScope(data);
     if (sequence !== stateSequence) return;
     const changed =
+      nextScope !== scope.value ||
+      data.dataRoot !== dataRoot.value ||
       data.authenticationEnabled !== authenticationEnabled.value ||
-      data.user?.id !== user.value?.id ||
-      data.user?.role !== user.value?.role;
+      (user.value &&
+        (data.user?.id !== user.value.id ||
+          data.user?.role !== user.value.role));
     if (changed) {
+      const hadIdentity = Boolean(scope.value || user.value);
       stopSession();
+      scope.value = "";
+      offlineSession.value = false;
+      user.value = null;
       status.value = null;
-      statusError.value = "";
       page.value = "reports";
+      if (hadIdentity) await clearReportCache();
+      if (sequence !== stateSequence) return;
     }
     authenticationEnabled.value = data.authenticationEnabled;
     initialized.value = data.initialized;
     today.value = data.today || localDate();
     user.value = data.user;
-    message.value =
-      expired && previousUser && authenticationEnabled.value && !user.value
-        ? "登录已失效，请重新登录。"
-        : "";
-    if (user.value && !events) startSession();
-    ready.value = true;
-  } catch (error) {
+    dataRoot.value = data.dataRoot;
+    scope.value = nextScope;
+    verified.value = true;
+    offlineSession.value = false;
+    setWritesAllowed(true);
+    if (nextScope)
+      await saveSession({
+        scope: nextScope,
+        dataRoot: dataRoot.value,
+        authenticationEnabled: data.authenticationEnabled,
+        today: today.value,
+        savedAt: Date.now(),
+        query: initialQuery.value,
+      });
     if (sequence !== stateSequence) return;
-    if (!ready.value) bootError.value = error.message;
-    else message.value = error.message;
+    failures = 0;
+    retryAt = 0;
+    message.value = "";
+    bootError.value = "";
+    ready.value = true;
+    if (user.value && !events && document.visibilityState === "visible")
+      startSession();
+    if (!wasVerified || changed) refreshKey.value++;
+  } catch (error) {
+    if (sequence !== stateSequence || error.name === "AbortError") return;
+    failures++;
+    retryAt =
+      Date.now() + Math.min(120_000, 10_000 * 2 ** Math.min(failures, 4));
+    networkFailure();
+    if (!ready.value) bootError.value = `${error.message}。联网后可重新连接。`;
+    else
+      message.value =
+        "服务暂不可达，正在显示已保存的报告；联网后会重新验证身份。";
+  } finally {
+    if (sequence === stateSequence) statePending = false;
   }
 }
-function boot() {
-  return refreshState({ reset: true });
+async function boot() {
+  retryAt = 0;
+  if (navigator.onLine === false && !ready.value)
+    bootError.value = "当前离线，且没有可用的报告缓存。请联网后重试。";
+  return refreshState();
 }
 function stopSession() {
   sessionGeneration++;
@@ -92,19 +172,21 @@ function stopSession() {
   events = null;
   live.value = false;
   clearInterval(statusTimer);
-  clearTimeout(eventTimer);
   statusPending = false;
 }
 async function loadStatus() {
-  if (!user.value || statusPending) return;
+  if (
+    !verified.value ||
+    !user.value ||
+    statusPending ||
+    document.visibilityState !== "visible"
+  )
+    return;
   const generation = sessionGeneration;
   statusPending = true;
   try {
-    const result = await request("/status");
-    if (generation === sessionGeneration) {
-      status.value = result;
-      statusError.value = "";
-    }
+    const result = await request("/status", { timeout: 15_000, retries: 0 });
+    if (generation === sessionGeneration) acceptStatus(result);
   } catch (error) {
     if (generation === sessionGeneration) statusError.value = error.message;
   } finally {
@@ -114,46 +196,72 @@ async function loadStatus() {
 function startSession() {
   stopSession();
   loadStatus();
-  statusTimer = setInterval(loadStatus, 15_000);
+  statusTimer = setInterval(loadStatus, 30_000);
   const source = new EventSource("/api/events", { withCredentials: true });
   events = source;
   source.onopen = () => {
-    if (events !== source) return;
-    live.value = true;
-    refreshKey.value++;
-    loadStatus();
-  };
-  source.addEventListener("data", () => {
-    if (events !== source) return;
-    clearTimeout(eventTimer);
-    eventTimer = setTimeout(() => {
-      refreshKey.value++;
+    if (events === source) {
+      live.value = true;
       loadStatus();
-    }, 200);
-  });
-  source.addEventListener("access", () => {
-    if (events === source) boot();
-  });
-  source.onerror = () => {
-    if (events !== source) return;
-    live.value = false;
-    // Keep EventSource's own reconnect backoff unless access actually changed.
-    expireSession();
+    }
   };
+  source.addEventListener("data", (event) => {
+    if (events !== source) return;
+    try {
+      acceptRevision(JSON.parse(event.data).revision);
+    } catch {
+      /* Ignore malformed notifications. */
+    }
+  });
+  source.addEventListener("status", (event) => {
+    if (events !== source) return;
+    try {
+      acceptStatus(JSON.parse(event.data));
+    } catch {
+      /* The next status poll can recover. */
+    }
+  });
+  source.addEventListener("access", invalidateSession);
+  source.onerror = () => {
+    if (events === source) live.value = false;
+  };
+}
+function networkFailure() {
+  setWritesAllowed(false);
+  verified.value = false;
+  offlineSession.value = Boolean(scope.value || user.value);
+  stopSession();
+}
+async function invalidateSession(event) {
+  if (invalidating) return;
+  invalidating = true;
+  ++stateSequence;
+  stateController?.abort();
+  statePending = false;
+  stopSession();
+  setWritesAllowed(false);
+  verified.value = false;
+  offlineSession.value = false;
+  scope.value = "";
+  dataRoot.value = null;
+  user.value = null;
+  status.value = null;
+  revision = null;
+  page.value = "reports";
+  ready.value = false;
+  if (event?.type !== "lizi:cache-invalidated") await clearReportCache();
+  invalidating = false;
+  boot();
 }
 function authenticated() {
-  page.value = "reports";
-  return boot();
-}
-function expireSession() {
-  return refreshState({ expired: true });
+  return invalidateSession();
 }
 async function logout() {
+  if (!verified.value) return;
   logoutBusy.value = true;
-  message.value = "";
   try {
     await request("/auth/logout", { method: "POST", body: {} });
-    await boot();
+    await invalidateSession();
   } catch (error) {
     message.value = error.message;
   } finally {
@@ -161,28 +269,63 @@ async function logout() {
   }
 }
 function resume() {
-  if (document.visibilityState === "visible") {
-    refreshState();
-    if (user.value) {
-      refreshKey.value++;
-      loadStatus();
-    }
+  if (document.visibilityState !== "visible") {
+    stopSession();
+    return;
   }
+  retryAt = 0;
+  refreshState();
 }
-onMounted(() => {
+function cacheWarning(event) {
+  cacheMessage.value = event.detail;
+}
+function shellMessage(event) {
+  if (event.data?.type === "lizi-shell-update") updateAvailable.value = true;
+}
+function reloadApp() {
+  window.location.reload();
+}
+onMounted(async () => {
+  window.addEventListener("lizi:unauthorized", invalidateSession);
+  window.addEventListener("lizi:cache-invalidated", invalidateSession);
+  window.addEventListener("lizi:data-root-changed", invalidateSession);
+  window.addEventListener("lizi:network-failure", networkFailure);
+  window.addEventListener("lizi:cache-warning", cacheWarning);
+  window.addEventListener("online", resume);
+  window.addEventListener("offline", networkFailure);
+  document.addEventListener("visibilitychange", resume);
+  navigator.serviceWorker?.addEventListener("message", shellMessage);
+  const initialSequence = stateSequence;
+  const cached = await readSession();
+  if (cached?.scope && !invalidating && initialSequence === stateSequence) {
+    scope.value = cached.scope;
+    dataRoot.value = cached.dataRoot;
+    authenticationEnabled.value = cached.authenticationEnabled;
+    today.value = cached.today || localDate();
+    initialQuery.value = cached.query;
+    offlineSession.value = true;
+    ready.value = true;
+  }
   boot();
   authTimer = setInterval(() => {
-    if (!user.value && ready.value) refreshState();
-  }, 15_000);
-  window.addEventListener("lizi:unauthorized", expireSession);
-  document.addEventListener("visibilitychange", resume);
+    if (document.visibilityState === "visible" && Date.now() >= retryAt)
+      refreshState();
+  }, 30_000);
 });
 onUnmounted(() => {
-  stateSequence++;
+  ++stateSequence;
+  stateController?.abort();
   clearInterval(authTimer);
   stopSession();
-  window.removeEventListener("lizi:unauthorized", expireSession);
+  window.removeEventListener("lizi:unauthorized", invalidateSession);
+  window.removeEventListener("lizi:cache-invalidated", invalidateSession);
+  window.removeEventListener("lizi:data-root-changed", invalidateSession);
+  window.removeEventListener("lizi:network-failure", networkFailure);
+  window.removeEventListener("lizi:cache-warning", cacheWarning);
+  window.removeEventListener("online", resume);
+  window.removeEventListener("offline", networkFailure);
   document.removeEventListener("visibilitychange", resume);
+  navigator.serviceWorker?.removeEventListener("message", shellMessage);
 });
 </script>
 
@@ -197,9 +340,10 @@ onUnmounted(() => {
     <p v-else class="muted">正在连接服务…</p>
   </main>
   <AuthView
-    v-else-if="authenticationEnabled && !user"
+    v-else-if="authenticationEnabled && !user && !offlineSession"
     :initialized="initialized"
     :message="message"
+    :offline="!verified"
     @authenticated="authenticated"
   />
   <div v-else class="app-shell">
@@ -220,17 +364,17 @@ onUnmounted(() => {
         </button>
       </nav>
       <div v-if="authenticationEnabled" class="sidebar-bottom">
-        <span class="avatar">{{
+        <span v-if="user" class="avatar">{{
           user.username.slice(0, 1).toUpperCase()
         }}</span>
-        <div class="user-name">
+        <div v-if="user" class="user-name">
           <strong>{{ user.username }}</strong
           ><span>{{ user.role === "admin" ? "管理员" : "报告查看者" }}</span>
         </div>
         <button
           class="icon-button"
           aria-label="退出登录"
-          :disabled="logoutBusy"
+          :disabled="logoutBusy || !verified"
           @click="logout"
         >
           <LogOut :size="18" />
@@ -244,21 +388,55 @@ onUnmounted(() => {
           >工作空间 <span>/</span>
           {{ nav.find((item) => item.id === page)?.label }}</span
         ><span class="connection" :class="{ offline: !live }"
-          ><i />{{ live ? "实时同步" : "连接恢复中" }}</span
+          ><i />{{
+            !verified
+              ? "离线 / 等待验证"
+              : live
+                ? "实时同步"
+                : "在线 · 同步重连中"
+          }}</span
         >
+        <button
+          v-if="authenticationEnabled && user"
+          class="icon-button mobile-logout"
+          aria-label="退出登录"
+          :disabled="logoutBusy || !verified"
+          @click="logout"
+        >
+          <LogOut :size="18" />
+        </button>
       </header>
+      <div v-if="!verified" class="shell-message notice" role="status">
+        仅显示此前缓存的报告，未缓存页不可离线查看。缓存不是登录凭据，设置与账户操作需联网验证。
+        <button @click="boot">重新连接</button>
+      </div>
+      <div v-if="cacheMessage" class="shell-message notice" role="status">
+        {{ cacheMessage }}
+      </div>
+      <div v-if="updateAvailable" class="shell-message notice" role="status">
+        应用已有新版本。<button @click="reloadApp">刷新应用</button>
+      </div>
       <div v-if="message" role="alert" class="shell-message error-message">
         {{ message }}
       </div>
       <main class="page-content">
         <ReportsView
+          v-if="user || offlineSession"
+          :key="scope"
+          :cache-scope="scope"
+          :data-root="dataRoot"
+          @query-changed="initialQuery = $event"
+          :initial-query="initialQuery"
+          :online="verified"
+          :active="page === 'reports'"
+          :scan-status="status"
           v-show="page === 'reports'"
           :today="today"
           :refresh-key="refreshKey"
           :live="live"
         />
         <SettingsView
-          v-if="page === 'settings'"
+          v-if="page === 'settings' && verified && user"
           :user="user"
           :authentication-enabled="authenticationEnabled"
           :initialized="initialized"
@@ -269,11 +447,20 @@ onUnmounted(() => {
           @access-changed="boot"
         />
         <AccountsView
-          v-if="authenticationEnabled && page === 'accounts'"
+          v-if="
+            authenticationEnabled && page === 'accounts' && verified && user
+          "
           :user="user"
           @logout="logout"
           @user-changed="refreshState"
         />
+        <section v-if="page !== 'reports' && !verified" class="state-panel">
+          <h2>{{ page === "accounts" ? "账户" : "设置与状态" }}需要在线验证</h2>
+          <p>
+            此页不保存离线副本。为避免误操作，离线时不显示配置或账户信息，也不能提交修改。
+          </p>
+          <button @click="boot">重新连接</button>
+        </section>
       </main>
     </div>
   </div>

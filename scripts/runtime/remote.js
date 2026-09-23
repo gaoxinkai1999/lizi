@@ -1,6 +1,7 @@
-import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
-import { writeFile, rename, unlink } from "node:fs/promises";
+import { spawn, execFile } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+import { writeFile, rename, unlink, mkdir, chmod } from "node:fs/promises";
+import { promisify } from "node:util";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { rootCertificates } from "node:tls";
@@ -8,6 +9,7 @@ import { isIP } from "node:net";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
+const execute = promisify(execFile);
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const defaults = {
   enabled: false,
@@ -78,18 +80,18 @@ function validate(input, previous) {
   return next;
 }
 
-function protectDirectory(directory) {
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+async function protectDirectory(directory) {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
   if (process.platform === "win32") {
     // SID-based ACLs work on localized Windows and on LocalService accounts.
-    const identity = execFileSync(
+    const { stdout: identity } = await execute(
       "whoami.exe",
       ["/user", "/fo", "csv", "/nh"],
-      { encoding: "utf8", windowsHide: true },
+      { encoding: "utf8", windowsHide: true, timeout: 10000 },
     );
     const sid = identity.match(/S-1-\d+(?:-\d+)+/)?.[0];
     if (!sid) throw new Error("无法识别当前 Windows 安全账户");
-    execFileSync(
+    await execute(
       "icacls.exe",
       [
         directory,
@@ -99,9 +101,9 @@ function protectDirectory(directory) {
         "*S-1-5-18:(OI)(CI)F",
         "*S-1-5-32-544:(OI)(CI)F",
       ],
-      { windowsHide: true, stdio: "pipe" },
+      { windowsHide: true, timeout: 15000 },
     );
-  } else chmodSync(directory, 0o700);
+  } else await chmod(directory, 0o700);
 }
 
 async function atomicWrite(path, content) {
@@ -140,7 +142,6 @@ export function createRemoteManager({ home, port }) {
   let probing = false;
 
   try {
-    protectDirectory(directory);
     if (existsSync(settingsPath))
       settings = validate(
         JSON.parse(readFileSync(settingsPath, "utf8")),
@@ -227,7 +228,7 @@ export function createRemoteManager({ home, port }) {
 
   async function start() {
     if (stopped || !settings.enabled || child) return;
-    protectDirectory(directory);
+    await protectDirectory(directory);
     // FRP enables TLS by default but does not verify certificates without trustedCaFile.
     // Only an administrator-controlled service environment can override this CA source.
     const roots = process.env.LIZI_FRP_CA_FILE
@@ -339,7 +340,7 @@ export function createRemoteManager({ home, port }) {
       const operation = queue.then(async () => {
         if (stopped) throw new Error("远程管理器已关闭");
         const next = validate(input, settings);
-        protectDirectory(directory);
+        await protectDirectory(directory);
         await atomicWrite(settingsPath, JSON.stringify(next, null, 2));
         await terminate();
         settings = next;

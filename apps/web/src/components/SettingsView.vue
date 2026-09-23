@@ -140,7 +140,7 @@ async function saveDirectory() {
         body: { dataPath: dataPath.value.trim() },
       }),
     );
-    success.value = "报告目录已保存。";
+    success.value = "报告根目录已保存，所选日期的数据将在后台按需准备。";
     emit("refresh-status");
     emit("reports-changed");
   } catch (cause) {
@@ -155,7 +155,8 @@ async function scan() {
   success.value = "";
   try {
     await request("/scan", { method: "POST", body: {} });
-    success.value = "重新扫描请求已完成，请查看下方扫描状态。";
+    success.value =
+      "已启动当前活跃日期的后台扫描，请查看下方进度；这不表示扫描已完成。";
     emit("refresh-status");
     emit("reports-changed");
   } catch (cause) {
@@ -294,7 +295,10 @@ onUnmounted(() => {
         <Server :size="21" />
         <div>
           <h2>服务状态</h2>
-          <p>由服务实时返回，每 15 秒更新。</p>
+          <p>
+            仅准备所选日期（跨夜含次日），进度实时推送；可见时每 30
+            秒补充更新状态。
+          </p>
         </div>
       </div>
       <p v-if="statusError" class="error-message" role="alert">
@@ -320,6 +324,14 @@ onUnmounted(() => {
           <div>
             <dt>扫描状态</dt>
             <dd>{{ status.scanning ? "正在扫描" : "空闲" }}</dd>
+          </div>
+          <div v-if="status.scanProgress">
+            <dt>当前日期扫描进度</dt>
+            <dd>
+              已检查 {{ status.scanProgress.visited }} 个 · 已入库
+              {{ status.scanProgress.indexed }} 份 · 无效
+              {{ status.scanProgress.invalid }} 个
+            </dd>
           </div>
           <div>
             <dt>最近扫描</dt>
@@ -366,7 +378,10 @@ onUnmounted(() => {
             <FolderOpen :size="21" />
             <div>
               <h2>报告目录</h2>
-              <p>服务只读取原始报告，不会修改或删除文件。</p>
+              <p>
+                请选择包含 YYYY-MM-DD
+                日期子目录的根目录，不是某一天的目录。只按查询日期读取（夜班/全天含次日），不会默认遍历所有历史；原始文件不会被修改或删除。
+              </p>
             </div>
           </div>
           <form class="form-stack" @submit.prevent="saveDirectory">

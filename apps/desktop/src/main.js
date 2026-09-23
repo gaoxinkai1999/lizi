@@ -24,6 +24,7 @@ let tray;
 let quitting = false;
 let loading = false;
 let retryTimer;
+let waitingForBackend = false;
 
 function isTrusted(url) {
   try {
@@ -55,22 +56,33 @@ function icon() {
   });
 }
 
-const waitingPage = `<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>粒子报告</title><style>body{font:16px system-ui;background:#f4f7fb;color:#20304a;display:grid;place-items:center;height:95vh}main{max-width:540px;padding:40px;background:white;border-radius:20px;box-shadow:0 12px 60px #20304a12}h1{font-size:26px}p{line-height:1.9;color:#607086}code{background:#f4f7fb;padding:3px 6px}</style><main><h1>正在连接后台服务</h1><p>后台独立运行，关闭此窗口不会停止采集。首次启动可能需要几秒钟，本页会自动重试。</p><p>若一直无法连接，请在 Windows 服务中确认 <code>LiziService</code> 已启动；开发模式请先运行 <code>npm run start</code>。</p></main></html>`;
+const waitingPage = `<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>粒子报告</title><style>body{font:16px system-ui;background:#f4f7fb;color:#20304a;display:grid;place-items:center;height:95vh}main{max-width:540px;padding:40px;background:white;border-radius:20px;box-shadow:0 12px 60px #20304a12}h1{font-size:26px}p{line-height:1.9;color:#607086}code{background:#f4f7fb;padding:3px 6px}</style><main><h1>后台暂未连接</h1><p>本窗口会自动重试。后台就绪后即可进入界面，无需等待历史报告扫描。</p><p>如果您已停止或禁用 <code>LiziService</code>，桌面不会自行重新启用它。请管理员在 Windows 服务中检查其状态；异常信息可从托盘菜单“后台日志位置”查阅。</p><p>关闭桌面窗口不会停止已经运行的后台服务。</p></main></html>`;
 
 async function connect() {
   if (loading || !window || window.isDestroyed() || quitting) return;
   loading = true;
   try {
-    const response = await fetch(`${origin}/api/health`, {
-      signal: AbortSignal.timeout(2500),
-    });
-    if (!response.ok || (await response.json()).ok !== true)
-      throw new Error("后台尚未就绪");
+    if (waitingForBackend) {
+      const response = await fetch(`${origin}/api/health`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!response.ok || (await response.json()).ok !== true)
+        throw new Error("后台尚未就绪");
+    }
     await window.loadURL(origin);
+    waitingForBackend = false;
     clearInterval(retryTimer);
     retryTimer = null;
   } catch {
-    if (!retryTimer) retryTimer = setInterval(connect, 2500);
+    if (!waitingForBackend && window && !window.isDestroyed()) {
+      waitingForBackend = true;
+      await window
+        .loadURL(
+          `data:text/html;charset=utf-8,${encodeURIComponent(waitingPage)}`,
+        )
+        .catch(() => {});
+    }
+    if (!retryTimer) retryTimer = setInterval(connect, 2000);
   } finally {
     loading = false;
   }
@@ -143,12 +155,10 @@ function createWindow() {
       defaultPath: join(app.getPath("downloads"), item.getFilename()),
     });
   });
-  void window
-    .loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(waitingPage)}`)
-    .then(() => {
-      if (!process.argv.includes("--hidden")) window.show();
-      void connect();
-    });
+  window.once("ready-to-show", () => {
+    if (!process.argv.includes("--hidden")) window.show();
+  });
+  void connect();
 }
 
 if (!app.requestSingleInstanceLock()) app.quit();

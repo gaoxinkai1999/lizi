@@ -1,8 +1,18 @@
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 
+const locations = new WeakMap();
+
+export function databaseLocation(db) {
+  const location = locations.get(db);
+  if (!location) throw new Error("报告索引需要持久数据库");
+  return location;
+}
+
 export function openDatabase(home) {
-  const db = new DatabaseSync(path.join(home, "lizi.sqlite"));
+  const location = path.resolve(home, "lizi.sqlite");
+  const db = new DatabaseSync(location);
+  locations.set(db, location);
   db.exec(`
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;

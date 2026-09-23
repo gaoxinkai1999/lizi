@@ -1,4 +1,5 @@
 import express from "express";
+import compression from "compression";
 import helmet from "helmet";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -43,7 +44,6 @@ export async function createApplication(options = {}) {
     home,
     options.allowedRoots ?? process.env.LIZI_ALLOWED_ROOTS,
   );
-  const store = new ReportStore(db, directories);
   const remote = createRemoteManager({ home, port });
   const clients = new Set();
   const auth = await createAuth(
@@ -63,6 +63,7 @@ export async function createApplication(options = {}) {
       clients.clear();
     },
   );
+  const store = new ReportStore(db, directories);
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", "loopback");
@@ -86,12 +87,18 @@ export async function createApplication(options = {}) {
       strictTransportSecurity: false,
     }),
   );
+  app.use(
+    compression({
+      filter: (req, res) =>
+        req.path !== "/api/events" && compression.filter(req, res),
+    }),
+  );
   app.use("/api", (req, res, next) => {
     res.setHeader("Cache-Control", "no-store");
     next();
   });
   app.use("/api", requireSameOrigin);
-  app.use(express.json({ limit: "128kb", strict: true }));
+  app.use(express.json({ limit: "1mb", strict: true }));
   app.use("/api", (req, res, next) => {
     if (
       !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
@@ -107,6 +114,7 @@ export async function createApplication(options = {}) {
       initialized: auth.initialized(),
       authenticationEnabled: auth.authenticationEnabled(),
       user: user ? publicUser(user) : null,
+      dataRoot: user ? store.root : null,
       today: todayString(),
     });
   });
@@ -117,15 +125,37 @@ export async function createApplication(options = {}) {
   app.put("/api/access", auth.admin, auth.setAccess);
   app.post("/api/auth/logout", auth.logout);
   app.post("/api/auth/password", auth.changePassword);
-  app.get("/api/reports", (req, res) =>
-    res.json({
-      reports: store.query(parseReportQuery(req.query)),
-      revision: store.revision,
-    }),
-  );
+  function assertCurrentIdentity(req) {
+    const current = auth.identity(req);
+    if (
+      !current ||
+      current.id !== req.user.id ||
+      current.role !== req.user.role
+    )
+      throw httpError(401, "访问权限已变化，请重新连接");
+  }
+  app.get("/api/reports", async (req, res) => {
+    const page = Number(req.query.page ?? 1);
+    const pageSize = Number(req.query.pageSize ?? 100);
+    if (
+      !Number.isSafeInteger(page) ||
+      page < 1 ||
+      !Number.isInteger(pageSize) ||
+      pageSize < 1 ||
+      pageSize > 100
+    )
+      throw httpError(400, "分页参数无效，每页最多100份报告");
+    const result = await store.query({
+      ...parseReportQuery(req.query),
+      page,
+      pageSize,
+    });
+    assertCurrentIdentity(req);
+    res.setHeader("Cache-Control", "private, no-cache");
+    res.json(result);
+  });
   app.post("/api/reports/export", async (req, res) => {
     const query = parseReportQuery(req.body);
-    let reports = store.query(query);
     if (req.body.ids !== undefined) {
       if (
         !Array.isArray(req.body.ids) ||
@@ -137,27 +167,37 @@ export async function createApplication(options = {}) {
       ) {
         throw httpError(400, "请选择有效报告后导出");
       }
-      const ids = new Set(req.body.ids);
-      reports = reports.filter((report) => ids.has(report.id));
-      if (reports.length !== ids.size)
-        throw httpError(409, "部分选中报告已经变化，请刷新后重新选择");
-    } else {
-      // The unselected export is always the complete non-aggregate analysis set.
-      reports = reports.filter((report) => !report.isAggregate);
     }
-    await exportReports(res, reports, query.date, query.shift);
+    if (
+      req.body.allSelected !== undefined &&
+      typeof req.body.allSelected !== "boolean"
+    )
+      throw httpError(400, "全班次选择参数无效");
+    if (req.body.allSelected && req.body.ids !== undefined)
+      throw httpError(400, "不能同时指定全班次和报告ID");
+    const snapshot = await store.exportSnapshot(query, {
+      ids: req.body.ids,
+      allSelected: req.body.allSelected === true,
+    });
+    try {
+      assertCurrentIdentity(req);
+      await exportReports(res, snapshot, query.date, query.shift);
+    } finally {
+      await snapshot.close();
+    }
   });
-  app.get("/api/status", (req, res) =>
-    res.json({
-      version: "1.0.0",
+  function status() {
+    return {
+      version: "2.1.0",
       ...store.status(),
       service: {
         mode: process.env.LIZI_SERVICE === "1" ? "service" : "standalone",
         uptime: Math.floor(process.uptime()),
       },
       remote: remote.getStatus(),
-    }),
-  );
+    };
+  }
+  app.get("/api/status", (req, res) => res.json(status()));
   function settings() {
     return {
       dataPath: store.root,
@@ -176,8 +216,10 @@ export async function createApplication(options = {}) {
   );
   app.post("/api/scan", auth.admin, async (req, res) => {
     if (!store.root) throw httpError(400, "请先配置报告目录");
-    await store.scan();
-    res.json({ ok: true });
+    void store
+      .scan()
+      .catch((error) => console.error("日期目录扫描失败：", error));
+    res.status(202).json({ ok: true, scanning: true });
   });
   app.put("/api/remote", auth.admin, async (req, res) => {
     await remote.configure(req.body);
@@ -186,7 +228,7 @@ export async function createApplication(options = {}) {
   app.get("/api/users", auth.admin, auth.listUsers);
   app.post("/api/users", auth.admin, auth.addUser);
   app.patch("/api/users/:id", auth.admin, auth.updateUser);
-  function sendRevision(client) {
+  function sendEvent(client, event, data) {
     const user = auth.identity(client.req);
     if (!user || user.id !== client.userId) {
       client.res.end();
@@ -197,7 +239,9 @@ export async function createApplication(options = {}) {
       return;
     }
     client.res.write(
-      `event: data\ndata: ${JSON.stringify({ revision: store.revision })}\n\n`,
+      event
+        ? `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+        : ": keepalive\n\n",
     );
   }
   app.get("/api/events", (req, res) => {
@@ -217,8 +261,9 @@ export async function createApplication(options = {}) {
     res.flushHeaders();
     const client = { req, res, userId: req.user.id };
     clients.add(client);
-    sendRevision(client);
-    const timer = setInterval(() => sendRevision(client), 20000);
+    sendEvent(client, "data", { revision: store.revision });
+    sendEvent(client, "status", status());
+    const timer = setInterval(() => sendEvent(client), 20000);
     timer.unref();
     res.on("close", () => {
       clearInterval(timer);
@@ -226,7 +271,12 @@ export async function createApplication(options = {}) {
     });
   });
   store.on("revision", () => {
-    for (const client of clients) sendRevision(client);
+    for (const client of clients)
+      sendEvent(client, "data", { revision: store.revision });
+  });
+  store.on("status", () => {
+    const current = status();
+    for (const client of clients) sendEvent(client, "status", current);
   });
   app.use("/api", (req, res, next) => next(httpError(404, "接口不存在")));
   const webDist = path.resolve(
@@ -235,7 +285,24 @@ export async function createApplication(options = {}) {
       path.join(projectRoot, "apps/web/dist"),
   );
   app.use(
-    express.static(webDist, { dotfiles: "deny", index: false, maxAge: 0 }),
+    "/assets",
+    express.static(path.join(webDist, "assets"), {
+      dotfiles: "deny",
+      immutable: true,
+      maxAge: "1y",
+      index: false,
+    }),
+  );
+  app.use(
+    express.static(webDist, {
+      dotfiles: "deny",
+      index: false,
+      maxAge: 0,
+      setHeaders(res, file) {
+        if (path.basename(file) === "sw.js")
+          res.setHeader("Cache-Control", "no-cache");
+      },
+    }),
   );
   app.get("/{*path}", async (req, res, next) => {
     if (!req.accepts("html")) return next(httpError(404, "页面不存在"));

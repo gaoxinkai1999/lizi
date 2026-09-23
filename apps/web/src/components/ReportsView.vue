@@ -12,28 +12,51 @@ import {
   X,
 } from "lucide-vue-next";
 import { localDate, request, saveBlob, showValue } from "../api.js";
+import { readReportPage, saveReportPage, pageKey } from "../offline-cache.js";
 import { createReportImages } from "../report-images.js";
 import Modal from "./Modal.vue";
 import ReportDetail from "./ReportDetail.vue";
-const props = defineProps({ today: String, refreshKey: Number, live: Boolean });
+const props = defineProps({
+  today: String,
+  refreshKey: Number,
+  live: Boolean,
+  online: Boolean,
+  active: Boolean,
+  cacheScope: String,
+  dataRoot: String,
+  initialQuery: Object,
+  scanStatus: Object,
+});
+const emit = defineEmits(["query-changed"]);
 const query = reactive({
-  date: props.today || localDate(),
-  shift: "day",
-  excludeAggregate: false,
+  date: props.initialQuery?.date || props.today || localDate(),
+  shift: props.initialQuery?.shift || "day",
+  excludeAggregate: Boolean(props.initialQuery?.excludeAggregate),
+  page: props.initialQuery?.page || 1,
+  pageSize: 100,
 });
 const reports = ref([]);
+const total = ref(0);
+const indexing = ref(false);
 const selected = ref(new Set());
+const wholeQuery = ref(false);
+const selectionCount = computed(() =>
+  wholeQuery.value ? total.value : selected.value.size,
+);
+const hasSelection = computed(
+  () => wholeQuery.value || selected.value.size > 0,
+);
 const loading = ref(false);
 const error = ref("");
 const actionError = ref("");
 const notice = ref("");
+const cached = ref(false);
 const mode = ref("auto");
 const mobileViewport = window.matchMedia("(max-width: 700px)");
 const isMobile = ref(mobileViewport.matches);
-const effectiveMode = computed(() => {
-  if (mode.value !== "auto") return mode.value;
-  return isMobile.value ? "cards" : "table";
-});
+const effectiveMode = computed(() =>
+  mode.value === "auto" ? (isMobile.value ? "cards" : "table") : mode.value,
+);
 const openDetails = ref(new Set());
 function updateViewport(event) {
   isMobile.value = event.matches;
@@ -42,12 +65,20 @@ mobileViewport.addEventListener("change", updateViewport);
 const optionsOpen = ref(false);
 const detail = ref(null);
 const actionBusy = ref("");
+const actionProgress = ref("");
 const images = ref([]);
 const imageOpen = ref(false);
 const loadedQuery = ref(null);
 const loadedAt = ref("");
+const pageCount = computed(() =>
+  Math.max(1, Math.ceil(total.value / query.pageSize)),
+);
 let controller,
-  sequence = 0;
+  imageController,
+  exportController,
+  activeKey = "",
+  sequence = 0,
+  pendingRefresh = false;
 const shiftNames = { day: "白班", night: "夜班", full: "完整班次" };
 const timeRange = computed(
   () =>
@@ -57,18 +88,18 @@ const timeRange = computed(
       full: "07:00 – 次日 07:00",
     })[query.shift],
 );
-const chosenReports = computed(() =>
-  reports.value.filter((report) => selected.value.has(report.id)),
-);
 const simpleReports = computed(() =>
-  selected.value.size ? chosenReports.value : reports.value,
+  selected.value.size && !wholeQuery.value
+    ? reports.value.filter((report) => selected.value.has(report.id))
+    : reports.value,
 );
+function isSelected(id) {
+  return wholeQuery.value || selected.value.has(id);
+}
 const allSelected = computed(
   () =>
-    reports.value.length > 0 && selected.value.size === reports.value.length,
-);
-const totalExportable = computed(
-  () => reports.value.filter((report) => !report.isAggregate).length,
+    reports.value.length > 0 &&
+    reports.value.every((report) => isSelected(report.id)),
 );
 const testsCount = computed(() =>
   Math.max(
@@ -76,101 +107,207 @@ const testsCount = computed(() =>
     ...reports.value.map((report) => report.testResults?.length || 0),
   ),
 );
-const readyForActions = computed(
-  () =>
-    !loading.value &&
-    !error.value &&
-    loadedQuery.value &&
-    reports.value.length > 0,
+const readyForActions = computed(() =>
+  Boolean(loadedQuery.value && total.value > 0 && !indexing.value),
 );
-async function loadReports(reset = false) {
-  controller?.abort();
-  controller = new AbortController();
-  const current = ++sequence;
-  if (reset) {
-    selected.value = new Set();
-    openDetails.value = new Set();
+function displayResult(result, snapshot, savedAt, fromCache) {
+  reports.value = result.reports;
+  total.value = result.total;
+  indexing.value = Boolean(result.indexing);
+  loadedQuery.value = snapshot;
+  cached.value = fromCache;
+  loadedAt.value = new Date(savedAt).toLocaleString("zh-CN");
+  if (detail.value)
+    detail.value =
+      result.reports.find((report) => report.id === detail.value.id) || null;
+}
+async function loadReports() {
+  const snapshot = { ...query };
+  const key = pageKey(snapshot);
+  if (loading.value && activeKey === key) {
+    pendingRefresh = true;
+    return;
+  }
+  if (key !== activeKey) {
+    controller?.abort();
     reports.value = [];
     loadedQuery.value = null;
+    openDetails.value = new Set();
+    detail.value = null;
+    loadedAt.value = "";
+    error.value = "";
   }
-  if (!query.date) {
+  activeKey = key;
+  const current = ++sequence;
+  pendingRefresh = false;
+  if (!snapshot.date) {
     loading.value = false;
     error.value = "请选择报告日期。";
     return;
   }
-  const snapshot = { ...query };
+  controller = new AbortController();
+  const signal = controller.signal;
   loading.value = true;
   error.value = "";
   try {
+    if (!loadedQuery.value) {
+      const saved = await readReportPage(props.cacheScope, snapshot);
+      if (current !== sequence) return;
+      if (saved) displayResult(saved.data, snapshot, saved.savedAt, true);
+    }
+    if (!props.online) {
+      cached.value = Boolean(loadedQuery.value);
+      if (!loadedQuery.value)
+        error.value =
+          "此查询页尚未缓存，离线时不可用。请联网，或返回此前已查看的日期和页码。";
+      return;
+    }
+    if (!props.active || document.visibilityState !== "visible") {
+      pendingRefresh = true;
+      return;
+    }
     const result = await request(`/reports?${new URLSearchParams(snapshot)}`, {
-      signal: controller.signal,
+      signal,
     });
     if (current !== sequence) return;
-    reports.value = result.reports;
-    const available = new Set(result.reports.map((report) => report.id));
-    selected.value = new Set(
-      [...selected.value].filter((id) => available.has(id)),
-    );
-    loadedQuery.value = snapshot;
-    loadedAt.value = new Date().toLocaleTimeString("zh-CN", {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-    if (detail.value)
-      detail.value =
-        result.reports.find((report) => report.id === detail.value.id) || null;
+    if (result.root !== props.dataRoot) {
+      window.dispatchEvent(new Event("lizi:data-root-changed"));
+      return;
+    }
+    displayResult(result, snapshot, Date.now(), false);
+    if (snapshot.page > pageCount.value && !result.indexing) {
+      query.page = pageCount.value;
+      return;
+    }
+    await saveReportPage(props.cacheScope, snapshot, result);
   } catch (cause) {
     if (current === sequence && cause.name !== "AbortError")
       error.value = cause.message;
   } finally {
-    if (current === sequence) loading.value = false;
+    if (current === sequence) {
+      loading.value = false;
+      if (
+        pendingRefresh &&
+        props.online &&
+        props.active &&
+        document.visibilityState === "visible"
+      ) {
+        pendingRefresh = false;
+        queueMicrotask(loadReports);
+      }
+    }
   }
+}
+function clearSelection() {
+  selected.value = new Set();
+  wholeQuery.value = false;
 }
 watch(
   () => [query.date, query.shift, query.excludeAggregate],
-  () => loadReports(true),
+  () => {
+    query.page = 1;
+    clearSelection();
+    imageController?.abort();
+    releaseImages();
+    imageOpen.value = false;
+    notice.value = "";
+    actionError.value = "";
+  },
+  { flush: "sync" },
+);
+watch(
+  () => pageKey(query),
+  () => {
+    emit("query-changed", { ...query });
+    loadReports();
+  },
   { immediate: true },
 );
 watch(
-  () => props.refreshKey,
-  () => loadReports(),
+  () => [props.refreshKey, props.online],
+  () => {
+    if (props.active && document.visibilityState === "visible") loadReports();
+    else pendingRefresh = true;
+  },
 );
+watch(
+  () => props.active,
+  (active) => {
+    if (active && pendingRefresh) loadReports();
+  },
+);
+function resume() {
+  if (document.visibilityState === "visible" && props.active && pendingRefresh)
+    loadReports();
+}
+document.addEventListener("visibilitychange", resume);
 function toggle(id) {
+  if (wholeQuery.value) return;
   const next = new Set(selected.value);
-  next.has(id) ? next.delete(id) : next.add(id);
+  if (next.has(id)) next.delete(id);
+  else if (next.size >= 20_000) {
+    actionError.value =
+      "逐项选择最多 20000 份。导出整个班次请使用“选择整个班次”。";
+    return;
+  } else next.add(id);
   selected.value = next;
 }
 function toggleAll() {
-  selected.value = allSelected.value
-    ? new Set()
-    : new Set(reports.value.map((report) => report.id));
+  if (wholeQuery.value) {
+    clearSelection();
+    return;
+  }
+  const next = new Set(selected.value);
+  if (allSelected.value)
+    reports.value.forEach((report) => next.delete(report.id));
+  else reports.value.forEach((report) => next.add(report.id));
+  if (next.size > 20_000) {
+    actionError.value = "逐项选择最多 20000 份，请改用“选择整个班次”。";
+    return;
+  }
+  selected.value = next;
+}
+function chooseWholeQuery() {
+  selected.value = new Set();
+  wholeQuery.value = true;
 }
 function yesterday() {
   const day = new Date(`${props.today || localDate()}T12:00:00`);
   day.setDate(day.getDate() - 1);
   const date = localDate(day);
   if (query.date === date && query.shift === "full" && query.excludeAggregate)
-    loadReports(true);
+    loadReports();
   else Object.assign(query, { date, shift: "full", excludeAggregate: true });
 }
 async function exportReports(onlySelected = false) {
-  if (!readyForActions.value || actionBusy.value) return;
-  if (onlySelected && !selected.value.size) return;
-  if (!onlySelected && !totalExportable.value) {
-    actionError.value =
-      "排除总分析后没有可导出的报告。如需保留总分析，请全选后导出选中项。";
+  if (
+    !props.online ||
+    !readyForActions.value ||
+    actionBusy.value ||
+    (onlySelected && !hasSelection.value)
+  )
     return;
-  }
   actionBusy.value = "export";
   actionError.value = "";
   notice.value = "";
-  const snapshot = { ...loadedQuery.value, excludeAggregate: !onlySelected };
-  if (onlySelected) snapshot.ids = [...selected.value];
+  const { date, shift, excludeAggregate } = loadedQuery.value;
+  const snapshot = {
+    date,
+    shift,
+    excludeAggregate: onlySelected ? excludeAggregate : true,
+  };
+  if (onlySelected) {
+    if (wholeQuery.value) snapshot.allSelected = true;
+    else snapshot.ids = [...selected.value];
+  }
+  exportController = new AbortController();
   try {
     const response = await request("/reports/export", {
       method: "POST",
       body: snapshot,
       binary: true,
+      timeout: 180_000,
+      signal: exportController.signal,
     });
     const disposition = response.headers.get("Content-Disposition") || "";
     const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i);
@@ -195,27 +332,91 @@ function releaseImages() {
   images.value.forEach((image) => URL.revokeObjectURL(image.url));
   images.value = [];
 }
+async function* imageReports(snapshot, chosen, entire, signal) {
+  const remaining = new Set(chosen);
+  const explicit = entire || remaining.size > 0;
+  let revision,
+    pages = 1,
+    generated = 0;
+  for (let page = 1; page <= pages; page++) {
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+    const params = {
+      ...snapshot,
+      page,
+      pageSize: 100,
+      excludeAggregate: explicit ? snapshot.excludeAggregate : true,
+    };
+    let result;
+    if (props.online)
+      result = await request(`/reports?${new URLSearchParams(params)}`, {
+        signal,
+      });
+    else {
+      // Offline selection uses exactly the cached query, filtering aggregates locally.
+      const saved = await readReportPage(props.cacheScope, {
+        ...params,
+        excludeAggregate: snapshot.excludeAggregate,
+      });
+      if (!saved)
+        throw new Error(
+          `第 ${page} 页未缓存，无法生成完整图片。请联网后重试。`,
+        );
+      result = saved.data;
+    }
+    if (result.indexing)
+      throw new Error(
+        "此页数据仍在准备，或缓存保存时尚未准备完成。请联网等待完成后生成完整图片。",
+      );
+    if (revision !== undefined && revision !== result.revision)
+      throw new Error("报告在生成期间发生变化，请刷新后重试，避免跨页遗漏。");
+    if (result.root !== props.dataRoot) {
+      window.dispatchEvent(new Event("lizi:data-root-changed"));
+      throw new Error("报告根目录已变化，请重新验证后生成图片。");
+    }
+    revision = result.revision;
+    pages = Math.max(1, Math.ceil(result.total / 100));
+    for (const report of result.reports) {
+      if (
+        entire ||
+        (explicit ? remaining.has(report.id) : !report.isAggregate)
+      ) {
+        remaining.delete(report.id);
+        generated++;
+        yield report;
+      }
+    }
+    actionProgress.value = `已读取 ${page} / ${pages} 页，已处理 ${generated} 份报告`;
+    if (explicit && !entire && !remaining.size) break;
+  }
+  if (remaining.size)
+    throw new Error(
+      `有 ${remaining.size} 份已选报告不在当前查询中，请刷新并重新选择。`,
+    );
+  if (!generated) throw new Error("排除总分析后没有可生成图片的报告。");
+}
 async function generateImages() {
   if (!readyForActions.value || actionBusy.value) return;
-  const source = selected.value.size
-    ? chosenReports.value
-    : reports.value.filter((report) => !report.isAggregate);
-  if (!source.length) {
-    actionError.value = "排除总分析后没有可生成图片的报告。";
-    return;
-  }
   actionBusy.value = "image";
   actionError.value = "";
   notice.value = "";
-  const title = `${loadedQuery.value.date} ${shiftNames[loadedQuery.value.shift]}`;
+  actionProgress.value = "正在按需读取报告…";
+  imageController = new AbortController();
+  const signal = imageController.signal;
+  const snapshot = { ...loadedQuery.value };
+  const title = `${snapshot.date} ${shiftNames[snapshot.shift]}`;
   try {
     releaseImages();
-    images.value = await createReportImages(source, title);
+    images.value = await createReportImages(
+      imageReports(snapshot, [...selected.value], wholeQuery.value, signal),
+      title,
+      { signal },
+    );
     imageOpen.value = true;
   } catch (cause) {
-    actionError.value = cause.message;
+    if (cause.name !== "AbortError") actionError.value = cause.message;
   } finally {
     actionBusy.value = "";
+    actionProgress.value = "";
   }
 }
 async function copyImage(image) {
@@ -235,8 +436,11 @@ async function copyImage(image) {
 onUnmounted(() => {
   sequence++;
   controller?.abort();
+  imageController?.abort();
+  exportController?.abort();
   releaseImages();
   mobileViewport.removeEventListener("change", updateViewport);
+  document.removeEventListener("visibilitychange", resume);
 });
 </script>
 
@@ -308,9 +512,12 @@ onUnmounted(() => {
     </section>
     <div class="results-toolbar">
       <div class="result-count">
-        <strong>{{ loading ? "查询中…" : `${reports.length} 份报告` }}</strong
-        ><span v-if="loadedAt && !loading" class="muted"
-          >{{ loadedAt }} 更新</span
+        <strong>{{
+          loadedQuery ? `${total} 份报告` : loading ? "查询中…" : "报告查询"
+        }}</strong
+        ><span v-if="loadedAt" class="muted"
+          >{{ cached || !online ? "缓存于" : "更新于" }} {{ loadedAt
+          }}{{ loading ? " · 后台更新中…" : "" }}</span
         >
       </div>
       <label class="view-select"
@@ -323,7 +530,43 @@ onUnmounted(() => {
         </select></label
       >
     </div>
-    <div v-if="error" role="alert" class="state-panel error-state">
+    <p
+      v-if="online && (indexing || scanStatus?.scanning)"
+      class="notice"
+      role="status"
+    >
+      正在准备所选日期数据，可先查看已入库报告。
+      <template v-if="scanStatus?.scanProgress"
+        >已检查 {{ scanStatus.scanProgress.visited }} 个文件 · 已入库
+        {{ scanStatus.scanProgress.indexed }} 份 · 无效
+        {{ scanStatus.scanProgress.invalid }} 个</template
+      >
+    </p>
+    <p v-if="!online" class="notice">
+      离线报告仅供查看；Excel 导出需联网。图片仅在所需查询页均已缓存时可生成。
+    </p>
+    <p v-if="!online && indexing" class="notice">
+      此缓存保存时日期数据尚未准备完成，可能不完整；完整导出和图片需联网完成准备后再操作。
+    </p>
+    <p v-if="error && reports.length" role="alert" class="error-message">
+      更新未完成：{{ error }}。下方保留上次报告。
+    </p>
+    <div
+      v-if="loadedQuery || query.page > 1"
+      class="pagination"
+      aria-label="报告分页"
+    >
+      <button :disabled="query.page <= 1" @click="query.page--">上一页</button>
+      <span>第 {{ query.page }} / {{ pageCount }} 页 · 每页最多 100 份</span>
+      <button :disabled="query.page >= pageCount" @click="query.page++">
+        下一页
+      </button>
+    </div>
+    <div
+      v-if="error && !reports.length"
+      role="alert"
+      class="state-panel error-state"
+    >
       <h2>报告未能加载</h2>
       <p>{{ error }}</p>
       <button @click="loadReports()"><RefreshCw :size="18" />重新查询</button>
@@ -340,8 +583,24 @@ onUnmounted(() => {
     </div>
     <div v-else-if="!reports.length" class="state-panel">
       <FileSearch :size="38" />
-      <h2>这个班次还没有报告</h2>
-      <p>试试其他日期或班次。新报告到达后会自动更新。</p>
+      <h2>
+        {{
+          !online
+            ? "此缓存页中没有报告"
+            : indexing
+              ? "正在准备当前日期报告"
+              : "这个班次还没有报告"
+        }}
+      </h2>
+      <p>
+        {{
+          !online
+            ? "这不代表服务端没有报告。请联网更新，或选择其他已缓存查询。"
+            : indexing
+              ? "已启动按需读取；无需等待全部完成，入库后会自动显示。"
+              : "试试其他日期或班次。新报告到达后会自动更新。"
+        }}
+      </p>
       <button @click="yesterday">查看昨日完整报告</button>
     </div>
     <template v-else>
@@ -350,17 +609,38 @@ onUnmounted(() => {
           ><input
             type="checkbox"
             :checked="allSelected"
-            :indeterminate="selected.size > 0 && !allSelected"
-            :disabled="loading"
+            :indeterminate="
+              !wholeQuery &&
+              reports.some((report) => selected.has(report.id)) &&
+              !allSelected
+            "
             @change="toggleAll"
-          />{{ allSelected ? "取消全选" : "全选" }}</label
-        ><span class="muted">{{
-          selected.size ? `已选 ${selected.size} 份` : "勾选报告可批量操作"
-        }}</span>
+          />{{
+            wholeQuery
+              ? "取消整个班次选择"
+              : allSelected
+                ? "取消本页"
+                : "选择本页"
+          }}</label
+        ><button @click="chooseWholeQuery" :disabled="wholeQuery">
+          选择整个班次（{{ total }} 份）
+        </button>
+        <span class="muted"
+          >{{
+            hasSelection
+              ? `已跨页选择 ${selectionCount} 份`
+              : "逐项或本页选择会跨页保留"
+          }}{{
+            wholeQuery ? " · 如需逐项调整，请先取消整个班次选择" : ""
+          }}</span
+        >
       </div>
       <div
         class="report-results"
-        :class="[`view-${mode}`, { 'is-loading': loading }]"
+        :class="[
+          `view-${effectiveMode}`,
+          { 'is-loading': loading && !reports.length },
+        ]"
         :aria-busy="loading"
       >
         <div v-if="effectiveMode === 'cards'" class="report-cards">
@@ -368,15 +648,15 @@ onUnmounted(() => {
             v-for="report in reports"
             :key="report.id"
             class="report-card"
-            :class="{ selected: selected.has(report.id) }"
+            :class="{ selected: isSelected(report.id) }"
           >
             <header>
               <label class="report-identity"
                 ><span class="check-target"
                   ><input
                     type="checkbox"
-                    :checked="selected.has(report.id)"
-                    :disabled="loading"
+                    :checked="isSelected(report.id)"
+                    :disabled="wholeQuery"
                     :aria-label="`选择 ${report.sampleName} ${report.time}`"
                     @change="toggle(report.id)" /></span
                 ><span
@@ -452,14 +732,14 @@ onUnmounted(() => {
               <tr
                 v-for="report in reports"
                 :key="report.id"
-                :class="{ selected: selected.has(report.id) }"
+                :class="{ selected: isSelected(report.id) }"
               >
                 <td>
                   <label class="check-target"
                     ><input
                       type="checkbox"
-                      :checked="selected.has(report.id)"
-                      :disabled="loading"
+                      :checked="isSelected(report.id)"
+                      :disabled="wholeQuery"
                       :aria-label="`选择 ${report.sampleName} ${report.time}`"
                       @change="toggle(report.id)"
                   /></label>
@@ -491,7 +771,10 @@ onUnmounted(() => {
             </tbody>
           </table>
         </div>
-        <div v-if="mode === 'simple'" class="simple-grid">
+        <div v-if="effectiveMode === 'simple'" class="simple-grid">
+          <p v-if="!simpleReports.length" class="muted">
+            本页没有已选报告；选择保留在其他页，可翻页查看或取消选择。
+          </p>
           <article
             v-for="report in simpleReports"
             :key="report.id"
@@ -512,8 +795,8 @@ onUnmounted(() => {
               <label class="check-target"
                 ><input
                   type="checkbox"
-                  :checked="selected.has(report.id)"
-                  :disabled="loading"
+                  :checked="isSelected(report.id)"
+                  :disabled="wholeQuery"
                   :aria-label="`选择 ${report.sampleName}`"
                   @change="toggle(report.id)"
               /></label>
@@ -544,10 +827,10 @@ onUnmounted(() => {
           </article>
         </div>
       </div>
-      <div v-if="!selected.size" class="all-actions">
+      <div v-if="!hasSelection" class="all-actions">
         <button
           class="primary"
-          :disabled="!readyForActions || !!actionBusy"
+          :disabled="!online || !readyForActions || !!actionBusy"
           @click="exportReports(false)"
         >
           <ArrowDownToLine :size="18" />{{
@@ -561,31 +844,32 @@ onUnmounted(() => {
             actionBusy === "image" ? "正在生成…" : "生成图片"
           }}
         </button>
-        <p class="field-help">
-          不含总分析 · 共
-          {{ totalExportable }} 份；如需包含总分析，请全选后导出选中项。
-        </p>
+        <p class="field-help">覆盖整个查询，默认排除总分析。</p>
       </div>
     </template>
+    <p v-if="actionProgress" class="notice" role="status">
+      {{ actionProgress }}
+      <button @click="imageController?.abort()">取消生成</button>
+    </p>
     <p v-if="actionError && !imageOpen" role="alert" class="error-message">
       {{ actionError }}
     </p>
     <p v-if="notice && !imageOpen" role="status" class="success-message">
       {{ notice }}
     </p>
-    <div v-if="selected.size" class="selection-bar">
+    <div v-if="hasSelection" class="selection-bar">
       <div class="selection-summary">
-        <Check :size="18" /><strong>已选 {{ selected.size }} 份</strong
+        <Check :size="18" /><strong>已选 {{ selectionCount }} 份</strong
         ><button
           class="icon-button"
           aria-label="取消全部选择"
-          @click="selected = new Set()"
+          @click="clearSelection"
         >
           <X :size="17" />
         </button>
       </div>
       <div class="selection-actions">
-        <button :disabled="loading" @click="mode = 'simple'">简易模式</button
+        <button @click="mode = 'simple'">简易模式</button
         ><button
           :disabled="!readyForActions || !!actionBusy"
           @click="generateImages"
@@ -595,7 +879,7 @@ onUnmounted(() => {
           }}</span></button
         ><button
           class="primary"
-          :disabled="!readyForActions || !!actionBusy"
+          :disabled="!online || !readyForActions || !!actionBusy"
           @click="exportReports(true)"
         >
           <ArrowDownToLine :size="17" />{{

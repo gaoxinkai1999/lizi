@@ -31,16 +31,30 @@ function drawCell(
   context.restore();
 }
 
-export async function createReportImages(reports, title) {
-  const measurementCount = Math.max(
-    20,
-    ...reports.map((report) => report.testResults?.length || 0),
-  );
+async function* batches(reports, signal) {
+  let rows = [];
+  for await (const report of reports) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    rows.push(report);
+    if (rows.length === 25) {
+      yield rows;
+      rows = [];
+    }
+  }
+  if (rows.length) yield rows;
+}
+
+export async function createReportImages(reports, title, { signal } = {}) {
   const images = [];
+  let rowStart = 0;
   try {
-    for (let rowStart = 0; rowStart < reports.length; rowStart += 25) {
-      const rows = reports.slice(rowStart, rowStart + 25);
+    for await (const rows of batches(reports, signal)) {
+      const measurementCount = Math.max(
+        20,
+        ...rows.map((report) => report.testResults?.length || 0),
+      );
       for (let testStart = 0; testStart < measurementCount; testStart += 20) {
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
         const count = Math.min(20, measurementCount - testStart);
         const columns = [
           150,
@@ -65,7 +79,7 @@ export async function createReportImages(reports, title) {
         context.fillStyle = "#65758a";
         context.font = "20px sans-serif";
         context.fillText(
-          `报告 ${rowStart + 1}–${rowStart + rows.length} / ${reports.length} · 测量 ${testStart + 1}–${testStart + count} · 硬度单位 g`,
+          `报告 ${rowStart + 1}–${rowStart + rows.length} · 测量 ${testStart + 1}–${testStart + count} · 硬度单位 g`,
           24,
           86,
         );
@@ -119,6 +133,7 @@ export async function createReportImages(reports, title) {
             "image/png",
           ),
         );
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
         images.push({
           blob,
           url: URL.createObjectURL(blob),
@@ -127,6 +142,7 @@ export async function createReportImages(reports, title) {
         canvas.width = 0;
         canvas.height = 0;
       }
+      rowStart += rows.length;
     }
     return images;
   } catch (error) {

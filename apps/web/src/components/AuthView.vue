@@ -2,7 +2,11 @@
 import { onMounted, reactive, ref } from "vue";
 import { Activity, ArrowRight, ShieldCheck } from "lucide-vue-next";
 import { request } from "../api.js";
-const props = defineProps({ initialized: Boolean, message: String });
+const props = defineProps({
+  initialized: Boolean,
+  message: String,
+  offline: Boolean,
+});
 const emit = defineEmits(["authenticated"]);
 const form = reactive({ token: "", username: "", password: "", confirm: "" });
 const busy = ref(false);
@@ -18,7 +22,7 @@ onMounted(async () => {
   }
 });
 async function submit() {
-  if (busy.value) return;
+  if (busy.value || props.offline) return;
   error.value = "";
   if (!props.initialized && form.password !== form.confirm) {
     error.value = "两次输入的密码不一致。";
@@ -66,6 +70,9 @@ async function submit() {
         }}
       </p>
       <p v-if="message" class="notice">{{ message }}</p>
+      <p v-if="offline" class="notice">
+        离线时不能登录或创建账户，请联网后重试。
+      </p>
       <form class="form-stack" @submit.prevent="submit">
         <label v-if="!initialized"
           >设置令牌<input
@@ -108,7 +115,7 @@ async function submit() {
             required
         /></label>
         <p v-if="error" role="alert" class="error-message">{{ error }}</p>
-        <button class="primary" :disabled="busy">
+        <button class="primary" :disabled="busy || offline">
           {{ busy ? "请稍候…" : initialized ? "登录" : "创建并登录"
           }}<ArrowRight :size="18" />
         </button>

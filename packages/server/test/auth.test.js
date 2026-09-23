@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout } from "node:timers/promises";
 import { createApplication } from "../src/app.js";
 
 async function fixture(t) {
@@ -177,8 +178,10 @@ test("public access serves reports and administration without cookies but reject
     role: "admin",
   });
   const root = path.join(home, "reports");
-  await fs.mkdir(root);
-  const reportPath = path.join(root, "sample.txt");
+  await fs.mkdir(path.join(root, "2026-09-23", "instrument"), {
+    recursive: true,
+  });
+  const reportPath = path.join(root, "2026-09-23", "instrument", "sample.txt");
   await fs.writeFile(
     reportPath,
     "Date 2026-09-23_07-00-00\nSample Name 2 A\nEffective Tests 1\nAVERAGE HARDNESS 0\nTOTAL TESTS 1\nINVALID TESTS 0\nSTEP 0\n1 1 0 0\n",
@@ -197,11 +200,18 @@ test("public access serves reports and administration without cookies but reject
   assert.equal((await request("/api/directories")).status, 200);
   assert.equal(
     (await request("/api/scan", { method: "POST", body: {} })).status,
-    200,
+    202,
   );
-  const reports = await (
-    await request("/api/reports?date=2026-09-23&shift=day")
-  ).json();
+  let reports;
+  const deadline = Date.now() + 10000;
+  do {
+    reports = await (
+      await request("/api/reports?date=2026-09-23&shift=day")
+    ).json();
+    if (!reports.indexing) break;
+    await setTimeout(25);
+  } while (Date.now() < deadline);
+  assert.equal(reports.indexing, false, "requested date finishes indexing");
   assert.deepEqual(
     reports.reports.map((report) => report.sampleName),
     ["2 A"],

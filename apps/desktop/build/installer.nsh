@@ -29,7 +29,7 @@ Function LiziReportDirectory
   ${NSD_CreateBrowseButton} 84% 47u 16% 16u "浏览"
   Pop $0
   ${NSD_OnClick} $0 LiziBrowseReportDirectory
-  ${NSD_CreateLabel} 0 80u 100% 52u "安装需管理员权限。系统启动后后台自动运行；关闭桌面不停止后台。卸载保留全部账户、设置和数据。以后可使用安装目录中的 Set-ReportRoots.ps1 为其他磁盘目录授权。"
+  ${NSD_CreateLabel} 0 80u 100% 52u "安装需管理员权限。后台随系统正常自动启动；关闭桌面不停止后台。报告按所选日期按需加载，健康就绪无需等待历史索引。卸载保留账户、设置和数据。以后可用 Set-ReportRoots.ps1 授权其他目录。"
   Pop $0
   nsDialogs::Show
 FunctionEnd
@@ -52,28 +52,36 @@ FunctionEnd
 
 !macro customInstall
   SetShellVarContext all
+  SetDetailsView show
+  DetailPrint "正在检查资源、准备目录并注册后台。目录权限继承可能耗时；各阶段及耗时会显示在下方。"
+  DetailPrint "安装日志：$APPDATA\LiziInstaller\install.log（管理员可读取，不包含凭据）"
   ${If} $LiziReportRoot == ""
     StrCpy $LiziReportRoot "$APPDATA\Lizi\reports"
   ${EndIf}
   FileOpen $0 "$PLUGINSDIR\lizi-report-root.txt" w
   FileWriteUTF16LE /BOM $0 "$LiziReportRoot"
   FileClose $0
-  nsExec::ExecToStack '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\service-scripts\Install-Service.ps1" -InstallRoot "$INSTDIR\resources" -ReportRootFile "$PLUGINSDIR\lizi-report-root.txt"'
+  nsExec::ExecToLog '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\service-scripts\Install-Service.ps1" -InstallRoot "$INSTDIR\resources" -ReportRootFile "$PLUGINSDIR\lizi-report-root.txt"'
   Pop $0
-  Pop $1
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "后台服务安装失败：$\r$\n$1" /SD IDOK
+    DetailPrint "后台安装失败，退出状态：$0。请以管理员身份读取 $APPDATA\LiziInstaller\install.log"
+    MessageBox MB_ICONSTOP "后台服务安装失败（状态 $0），报告、账户及设置未删除。$\r$\n阶段和错误定位见安装详情及日志：$\r$\n$APPDATA\LiziInstaller\install.log$\r$\n请以管理员身份读取；若日志无法创建，请检查 ProgramData 写入权限和磁盘空间。" /SD IDOK
     Abort
   ${EndIf}
+  DetailPrint "后台健康就绪。报告按所选日期按需加载，不等待历史目录全部索引。"
 !macroend
 !endif
 
 !macro customUnInstall
-  nsExec::ExecToStack '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\service-scripts\Uninstall-Service.ps1" -InstallRoot "$INSTDIR\resources"'
+  SetShellVarContext all
+  SetDetailsView show
+  DetailPrint "正在停止并移除后台服务；保留全部报告、账户、设置和缓存。"
+  DetailPrint "卸载日志：$APPDATA\LiziInstaller\uninstall.log（管理员可读取）"
+  nsExec::ExecToLog '"$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\resources\service-scripts\Uninstall-Service.ps1" -InstallRoot "$INSTDIR\resources"'
   Pop $0
-  Pop $1
   ${If} $0 != 0
-    MessageBox MB_ICONSTOP "后台服务卸载失败（已保留数据）：$\r$\n$1" /SD IDOK
+    DetailPrint "后台卸载失败，退出状态：$0。请以管理员身份读取 $APPDATA\LiziInstaller\uninstall.log"
+    MessageBox MB_ICONSTOP "后台服务卸载失败（状态 $0），已保留用户数据。$\r$\n阶段和错误定位见卸载详情及日志：$\r$\n$APPDATA\LiziInstaller\uninstall.log$\r$\n请以管理员身份读取；若日志无法创建，请检查 ProgramData 写入权限和磁盘空间。" /SD IDOK
     Abort
   ${EndIf}
 !macroend
