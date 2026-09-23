@@ -1,0 +1,28 @@
+{
+  "name": "lizi-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "粒子强度数据工作站",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
+  },
+  "scripts": {
+    "dev": "npm run dev --workspace @lizi/web",
+    "start": "npm run start --workspace @lizi/server",
+    "build": "npm run build --workspace @lizi/web",
+    "desktop": "npm run start --workspace @lizi/desktop",
+    "test": "node --test packages/core/test/*.test.js packages/server/test/*.test.js",
+    "prepare:resources": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Prepare-Resources.ps1",
+    "dist": "npm run build && npm run prepare:resources && npm run dist --workspace @lizi/desktop"
+  }
+}

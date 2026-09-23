@@ -1,0 +1,16 @@
+node_modules/
+**/dist/
+**/dist-*/
+release/
+.build/
+.runtime/
+.evidence/
+*.log
+*.sqlite*
+.env*
+!.env.example
+.idea/
+.vscode/
+coverage/
+apps/desktop/resources/
+.lizi/

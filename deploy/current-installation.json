@@ -1,0 +1,30 @@
+{
+  "applicationUrl": "https://lizi.abocidee.com",
+  "access": {
+    "authenticationEnabled": false,
+    "optionalAuthentication": true,
+    "publicCapabilities": "报告查询、导出、数据目录及远程设置；公开模式隐藏并禁用账户接口"
+  },
+  "windows": {
+    "installDirectory": "C:\\Lizi",
+    "dataDirectory": "C:\\ProgramData\\Lizi",
+    "service": "LiziService",
+    "account": "NT AUTHORITY\\LocalService",
+    "listen": "127.0.0.1:3210"
+  },
+  "ingress": {
+    "serverReference": "workspace-cn-new",
+    "implementation": "独立 systemd 服务与现有 1Panel OpenResty 容器；不直接运行通用 install-linux.sh 覆盖此安装",
+    "service": "lizi-frps.service",
+    "version": "0.68.0",
+    "controlPort": 17443,
+    "proxyListen": "127.0.0.1:13210",
+    "configuration": "/opt/lizi-frp/frps.toml",
+    "credentials": "仅存受保护的服务器配置和 Windows 服务数据目录，仓库不保存",
+    "nginxContainer": "1Panel-openresty-im16",
+    "nginxConfiguration": "/opt/1panel/www/conf.d/lizi.abocidee.com.conf",
+    "certificateDirectory": "/opt/1panel/www/sites/lizi.abocidee.com/ssl",
+    "certificateSource": "/opt/1panel/ssl/abocidee-wildcard",
+    "certificateWatcher": "lizi-frps-cert.path"
+  }
+}

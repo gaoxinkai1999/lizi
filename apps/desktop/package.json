@@ -1,0 +1,72 @@
+{
+  "name": "@lizi/desktop",
+  "version": "2.0.0",
+  "private": true,
+  "description": "粒子报告统一桌面客户端",
+  "author": "Lizi",
+  "type": "module",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win --x64 --dir --publish never",
+    "dist": "electron-builder --win nsis --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "com.lizi.reports",
+    "productName": "粒子报告",
+    "asar": true,
+    "directories": {
+      "output": "../../release",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/runtime",
+        "to": "runtime"
+      },
+      {
+        "from": "resources/backend",
+        "to": "backend"
+      },
+      {
+        "from": "resources/backend/node_modules",
+        "to": "backend/node_modules"
+      },
+      {
+        "from": "../../scripts/windows",
+        "to": "service-scripts"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true,
+      "include": "build/installer.nsh",
+      "artifactName": "Lizi-Setup-${version}-${arch}.${ext}",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
