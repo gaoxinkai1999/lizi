@@ -175,9 +175,43 @@ function Set-ProgramAcl([string] $Path) {
 }
 
 function Grant-ReportRead([string] $Path) {
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-19'), 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $serviceSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-19')
+    $requiredRights = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+    $readAccessRights = $requiredRights -bor [Security.AccessControl.FileSystemRights]::Synchronize
+    $rootRights = 0
+    $directoryRights = 0
+    $fileRights = 0
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.IdentityReference.Value -ne $serviceSid.Value) { continue }
+        # This checks the service grant, not effective access through other groups.
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) {
+            if (($rule.FileSystemRights -band $readAccessRights) -ne 0) {
+                Throw-LiziError "Report root '$Path' explicitly denies LocalService required read access ($($rule.FileSystemRights)). No ACL changes were made. Review the conflicting rule manually."
+            }
+            continue
+        }
+        if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0) {
+            $rootRights = $rootRights -bor $rule.FileSystemRights
+        }
+        # NoPropagate covers at most one generation, not arbitrary report depth.
+        if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::NoPropagateInherit) -ne 0) { continue }
+        if (($rule.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ContainerInherit) -ne 0) {
+            $directoryRights = $directoryRights -bor $rule.FileSystemRights
+        }
+        if (($rule.InheritanceFlags -band [Security.AccessControl.InheritanceFlags]::ObjectInherit) -ne 0) {
+            $fileRights = $fileRights -bor $rule.FileSystemRights
+        }
+    }
+    if (($rootRights -band $requiredRights) -eq $requiredRights -and
+        ($directoryRights -band $requiredRights) -eq $requiredRights -and
+        ($fileRights -band $requiredRights) -eq $requiredRights) {
+        Write-LiziProgress "Skipping report ACL update: '$Path' already grants LocalService ReadAndExecute on this directory with inheritance for subdirectories and files. Set-Acl was not called; descendant ACLs and effective access were not checked."
+        return
+    }
+    Write-LiziProgress "Adding missing inheritable LocalService ReadAndExecute grant to '$Path'; existing ACL entries are preserved. Descendant ACLs and effective access are not checked."
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($serviceSid, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
 }
 
 function Write-Utf8([string] $Path, [string] $Content) {

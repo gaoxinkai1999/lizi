@@ -20,14 +20,14 @@ try {
     [xml]$xml = Get-Content -LiteralPath $xmlPath -Raw
     $entry = $xml.service.env | Where-Object { $_.name -eq 'LIZI_ALLOWED_ROOTS' }
     if (-not $entry) { throw 'Installed service configuration does not contain LIZI_ALLOWED_ROOTS.' }
-    Set-LiziStage '[2/4] Authorizing LocalService read access (large directory ACL inheritance can take time)'
+    Set-LiziStage '[2/4] Checking LocalService report-root ACLs (existing grants are reused; missing grants can take time to inherit)'
     $rootNumber = 0
     foreach ($root in $roots) {
         $rootNumber++
-        Write-LiziProgress "Authorizing report directory $rootNumber/$($roots.Count): $root"
+        Write-LiziProgress "Checking report directory ACL $rootNumber/$($roots.Count): $root"
         $aclWatch = [Diagnostics.Stopwatch]::StartNew()
         Grant-ReportRead $root
-        Write-LiziProgress ('Report directory {0} authorized ({1:N1}s).' -f $rootNumber, $aclWatch.Elapsed.TotalSeconds)
+        Write-LiziProgress ('Report directory {0} ACL policy checked ({1:N1}s); effective access is not verified.' -f $rootNumber, $aclWatch.Elapsed.TotalSeconds)
     }
     Set-LiziStage '[3/4] Restarting the service with the authorized directories'
     Stop-LiziService

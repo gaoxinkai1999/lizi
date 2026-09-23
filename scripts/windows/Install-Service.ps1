@@ -49,16 +49,16 @@ try {
         if ($root.Equals($DataHome, [StringComparison]::OrdinalIgnoreCase)) { throw 'The report root cannot be the private data home.' }
     }
 
-    Set-LiziStage '[3/6] Authorizing directories for LocalService (large directory ACL inheritance can take time; no total installation timeout)'
+    Set-LiziStage '[3/6] Checking LocalService directory ACLs (existing report grants are reused; missing grants or private-directory isolation can take time; no total installation timeout)'
     $rootNumber = 0
     foreach ($root in $roots) {
         $rootNumber++
-        Write-LiziProgress "Authorizing report directory $rootNumber/$($roots.Count): $root"
+        Write-LiziProgress "Checking report directory ACL $rootNumber/$($roots.Count): $root"
         $aclWatch = [Diagnostics.Stopwatch]::StartNew()
         if ($root.Equals((Join-Path $DataHome 'reports'), [StringComparison]::OrdinalIgnoreCase)) {
             Set-PrivateAcl $root $sid -ReportDirectory
         } else { Grant-ReportRead $root }
-        Write-LiziProgress ('Report directory {0} authorized ({1:N1}s).' -f $rootNumber, $aclWatch.Elapsed.TotalSeconds)
+        Write-LiziProgress ('Report directory {0} ACL policy checked ({1:N1}s); effective access is not verified.' -f $rootNumber, $aclWatch.Elapsed.TotalSeconds)
     }
 
     # Only the interactive installing user can read this one file. No access to SQLite or FRP secrets.

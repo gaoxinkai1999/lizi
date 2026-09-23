@@ -26,14 +26,14 @@ const labels = [
 ];
 const escapeLabel = (label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const nextField = new RegExp(
-  `[ \\t]+(?:${labels.map(escapeLabel).join("|")})(?=[ \\t:]|：)`,
+  `(?:^|\\s+)(?:${labels.map(escapeLabel).join("|")})(?=\\s|[:：]|$)`,
   "i",
 );
 const fieldPatterns = new Map(
   labels.map((label) => [
     label,
     new RegExp(
-      `(?:^|[ \\t])${escapeLabel(label)}(?:[ \\t]*[:：][ \\t]*|[ \\t]+)([^\\n]*)`,
+      `(?:^|\\s)${escapeLabel(label)}(?:\\s*[:：]\\s*|\\s+)([^\\n]*)`,
       "im",
     ),
   ]),
@@ -112,8 +112,7 @@ export function parseReport(content) {
     const value = extract(label);
     if (value === null) return null;
     const match = new RegExp(`^(${NUMBER})(?:\\s|%|$)`).exec(value);
-    if (!match || !Number.isFinite(Number(match[1])))
-      throw new Error(`${label} 数值无效`);
+    if (!match || !Number.isFinite(Number(match[1]))) return null;
     return round ? Math.round(Number(match[1])) : Number(match[1]);
   };
   const dateTime = extract("Date");
@@ -165,15 +164,14 @@ export function parseReport(content) {
     segmentInfoList: [],
     isAggregate: /总|z/i.test(sampleName),
   };
-  const [measurements, segments = ""] = text.split(/Segment Analysis/i);
+  const [measurements, segments = text] = text.split(/Segment Analysis/i);
   const pattern = new RegExp(
-    `^[ \\t]*(\\d+)[ \\t]+(\\d+)[ \\t]+(${NUMBER})[ \\t]+(${NUMBER})[ \\t]*$`,
-    "gm",
+    `(?:^|\\s)(\\d+)\\s+(\\d+)\\s+(${NUMBER})\\s+(${NUMBER})(?=\\s|$)`,
+    "g",
   );
   for (const row of measurements.matchAll(pattern)) {
     const values = row.slice(1).map(Number);
-    if (values.some((value) => !Number.isFinite(value)))
-      throw new Error("测试数据数值越界");
+    if (values.some((value) => !Number.isFinite(value))) continue;
     report.testResults.push({
       number: values[0],
       test: values[1],
@@ -183,27 +181,13 @@ export function parseReport(content) {
   }
   report.testResults.sort((a, b) => a.number - b.number);
   for (const row of segments.matchAll(
-    /^[ \t]*(\d+(?:\.\d+)?[ \t]*-[ \t]*\d+(?:\.\d+)?)[ \t]+(\*+)[ \t]*$/gm,
+    /(?:^|\s)(\d+(?:\.\d+)?\s*-\s*\d+(?:\.\d+)?)\s+(\*+)(?=\s|$)/g,
   )) {
     report.segmentInfoList.push({
       range: row[1].replace(/\s/g, ""),
       stars: row[2],
     });
   }
-  // These fields are present in completed instrument reports, including zero-test runs.
-  if (
-    report.totalTests === null ||
-    report.invalidTests === null ||
-    report.averageHardness === null ||
-    report.step === null
-  ) {
-    throw new Error("报告尚未写入完整：缺少测试汇总或 STEP");
-  }
-  if (
-    report.effectiveTests !== null &&
-    report.testResults.length < report.effectiveTests
-  )
-    throw new Error("报告尚未写入完整：测试明细不足");
   return report;
 }
 

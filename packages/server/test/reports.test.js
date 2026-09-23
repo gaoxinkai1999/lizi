@@ -82,6 +82,14 @@ test("startup/root selection never indexes history; date queries expose bounded 
     report("999 old", "2010-01-01"),
   );
   await stableWrite(path.join(root, "loose.txt"), report("998 loose"));
+  await stableWrite(
+    path.join(root, query.date, "loose.txt"),
+    report("997 loose"),
+  );
+  await stableWrite(
+    path.join(root, query.date, "instrument", "Single_Report", "single.txt"),
+    report("996 individual measurement"),
+  );
   await store.setRoot(root);
   await store.scan();
   assert.equal(
@@ -150,6 +158,40 @@ test("unchanged invalid fingerprints are persisted and never re-parsed; watcher 
   await fs.rm(folder, { recursive: true });
   await deletion;
   assert.equal((await store.query(query)).total, 0);
+});
+
+test("parser upgrade retries previously rejected reports only in requested dates", async (t) => {
+  const { root, store, db } = await fixture(t);
+  const file = path.join(root, query.date, "instrument", "legacy.txt");
+  await stableWrite(
+    file,
+    `Date ${query.date}_08-00-00\nSample Name 2 legacy\nAVERAGE HARDNESS 125.4\n`,
+  );
+  const stat = await fs.stat(file);
+  db.prepare(
+    "INSERT INTO report_files(path,root,scope,fingerprint,valid,generation,error) VALUES(?,?,?,?,0,0,?)",
+  ).run(
+    file,
+    root,
+    query.date,
+    `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`,
+    "missing optional summary",
+  );
+  const historical = path.join(root, "2010-01-01", "instrument", "legacy.txt");
+  await stableWrite(
+    historical,
+    "Date 2010-01-01_08-00-00\nSample Name 1 history\n",
+  );
+  assert.equal(store.status().reportCount, 0);
+  const result = await settled(store);
+  assert.equal(result.total, 1);
+  assert.equal(result.reports[0].sampleName, "2 legacy");
+  assert.equal(result.reports[0].averageHardness, 125);
+  assert.equal(result.reports[0].step, null);
+  assert.equal(store.status().reportCount, 1);
+  assert.deepEqual(store.status().activeDates, [query.date]);
+  await store.scan();
+  assert.equal(store.status().scanProgress.parsed, 0);
 });
 
 test("night/full activate two date directories and preserve aggregate export selection and repeatable snapshots", async (t) => {

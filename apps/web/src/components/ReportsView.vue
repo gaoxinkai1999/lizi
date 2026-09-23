@@ -88,6 +88,54 @@ const timeRange = computed(
       full: "07:00 – 次日 07:00",
     })[query.shift],
 );
+const queryDirectories = computed(() => {
+  if (!props.dataRoot || !query.date) return [];
+  const root = props.dataRoot.replaceAll("\\", "/").replace(/\/$/, "");
+  const dates = [query.date];
+  if (query.shift !== "day") {
+    const next = new Date(`${query.date}T12:00:00Z`);
+    if (Number.isFinite(next.getTime())) {
+      next.setUTCDate(next.getUTCDate() + 1);
+      dates.push(next.toISOString().slice(0, 10));
+    }
+  }
+  return dates.map((date) => `${root}/${date}`);
+});
+const scanErrors = computed(() => {
+  const root = props.dataRoot?.replaceAll("\\", "/").replace(/\/$/, "");
+  return (props.scanStatus?.errors || [])
+    .filter((item) => {
+      const file = item.path.replaceAll("\\", "/").replace(/\/$/, "");
+      return (
+        file === root ||
+        queryDirectories.value.some(
+          (directory) => file === directory || file.startsWith(`${directory}/`),
+        )
+      );
+    })
+    .slice(0, 3);
+});
+const emptyState = computed(() => {
+  if (!props.online)
+    return {
+      title: "此缓存页中没有报告",
+      description: "这不代表服务端没有报告。请联网更新，或选择其他已缓存查询。",
+    };
+  if (indexing.value)
+    return {
+      title: "正在准备当前日期报告",
+      description: "已启动按需读取；无需等待全部完成，入库后会自动显示。",
+    };
+  if (scanErrors.value.length)
+    return {
+      title: "报告读取存在问题",
+      description: "请查看上方读取错误，核对报告格式和目录读取权限。",
+    };
+  return {
+    title: "这个班次还没有报告",
+    description: "试试其他日期或班次。新报告到达后会自动更新。",
+  };
+});
 const simpleReports = computed(() =>
   selected.value.size && !wholeQuery.value
     ? reports.value.filter((report) => selected.value.has(report.id))
@@ -542,6 +590,14 @@ onUnmounted(() => {
         {{ scanStatus.scanProgress.invalid }} 个</template
       >
     </p>
+    <div v-if="online && scanErrors.length" class="error-message" role="alert">
+      <strong
+        >所选日期有文件或目录未能读取，不能将当前数量视为完整结果。</strong
+      >
+      <p v-for="item in scanErrors" :key="item.path + item.message">
+        {{ item.path }}：{{ item.message }}
+      </p>
+    </div>
     <p v-if="!online" class="notice">
       离线报告仅供查看；Excel 导出需联网。图片仅在所需查询页均已缓存时可生成。
     </p>
@@ -583,23 +639,13 @@ onUnmounted(() => {
     </div>
     <div v-else-if="!reports.length" class="state-panel">
       <FileSearch :size="38" />
-      <h2>
-        {{
-          !online
-            ? "此缓存页中没有报告"
-            : indexing
-              ? "正在准备当前日期报告"
-              : "这个班次还没有报告"
-        }}
-      </h2>
-      <p>
-        {{
-          !online
-            ? "这不代表服务端没有报告。请联网更新，或选择其他已缓存查询。"
-            : indexing
-              ? "已启动按需读取；无需等待全部完成，入库后会自动显示。"
-              : "试试其他日期或班次。新报告到达后会自动更新。"
-        }}
+      <h2>{{ emptyState.title }}</h2>
+      <p>{{ emptyState.description }}</p>
+      <p v-if="online" class="field-help">
+        报告根目录：{{ dataRoot || "尚未设置，请先在设置中选择报告根目录" }}
+        <template v-if="queryDirectories.length">
+          <br />查找日期目录：{{ queryDirectories.join("、") }}
+        </template>
       </p>
       <button @click="yesterday">查看昨日完整报告</button>
     </div>

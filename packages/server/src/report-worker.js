@@ -14,8 +14,9 @@ const BATCH_BYTES = 1024 * 1024;
 const PAGE_BYTES = 24 * 1024 * 1024;
 const MAX_ACTIVE_DAYS = 4;
 const MAX_PENDING_PATHS = 256;
+// Parser changes invalidate fingerprints only when their date is requested.
 const fingerprint = (stat) =>
-  `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  `2:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 const db = new DatabaseSync(workerData.database);
 db.exec(
   "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;",
@@ -176,6 +177,8 @@ function current(scope, version) {
 
 function queue(scope, file) {
   if (closed || active.get(scope.date) !== scope) return;
+  if (file && path.relative(scope.directory, file).split(path.sep).length > 2)
+    return;
   clearTimeout(scope.retryTimer);
   scope.retryTimer = null;
   if (file && !scope.full) {
@@ -455,16 +458,23 @@ async function scanScope(scope, target) {
   }
   async function visit(file) {
     if (!current(scope, version) || excluded(file)) return;
+    const relative = path.relative(scope.directory, file);
+    const depth = relative ? relative.split(path.sep).length : 0;
+    if (depth > 2) return;
     try {
       const stat = await authorized(file);
       if (stat.isDirectory()) {
+        if (depth >= 2) return;
         const entries = await fs.opendir(file, { bufferSize: 32 });
         for await (const entry of entries) {
           if (!current(scope, version)) break;
-          if (entry.isSymbolicLink()) continue;
-          await visit(path.join(file, entry.name));
+          if (
+            (depth === 0 && entry.isDirectory()) ||
+            (depth === 1 && entry.isFile())
+          )
+            await visit(path.join(file, entry.name));
         }
-      } else if (stat.isFile()) {
+      } else if (stat.isFile() && depth === 2) {
         await processFile(file, stat);
       }
       if (
