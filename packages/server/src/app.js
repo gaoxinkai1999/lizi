@@ -4,15 +4,30 @@ import helmet from "helmet";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { isDate, todayString } from "@lizi/core";
 import { openDatabase } from "./database.js";
 import { createDirectoryPolicy, httpError } from "./directories.js";
 import { createAuth, publicUser, requireSameOrigin } from "./auth.js";
 import { ReportStore } from "./reports.js";
+import { createLanManager } from "./lan.js";
+import { FederatedReportStore } from "./federated-reports.js";
 import { exportReports } from "./export.js";
 import { createRemoteManager } from "../../../scripts/runtime/remote.js";
 
 const projectRoot = fileURLToPath(new URL("../../../", import.meta.url));
+async function ensureLocalAdminToken(home) {
+  const file = path.join(home, "lan-admin-token.txt");
+  try {
+    const token = (await fs.readFile(file, "utf8")).trim();
+    if (/^[A-Za-z0-9_-]{43}$/.test(token)) return token;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const token = randomBytes(32).toString("base64url");
+  await fs.writeFile(file, token, { encoding: "utf8", mode: 0o600, flag: "w" });
+  return token;
+}
 
 export function parseReportQuery(input = {}) {
   const date = input.date ?? todayString();
@@ -39,6 +54,7 @@ export async function createApplication(options = {}) {
     throw new Error("LIZI_PORT 无效");
   await fs.mkdir(home, { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") await fs.chmod(home, 0o700);
+  const localAdminToken = await ensureLocalAdminToken(home);
   const db = openDatabase(home);
   const directories = await createDirectoryPolicy(
     home,
@@ -63,7 +79,21 @@ export async function createApplication(options = {}) {
       clients.clear();
     },
   );
-  const store = new ReportStore(db, directories);
+  const localStore = new ReportStore(db, directories);
+  let lan;
+  try {
+    lan = await createLanManager({
+      home,
+      store: localStore,
+      options: options.lan ?? {},
+    });
+  } catch (error) {
+    await localStore.close();
+    await remote.stop();
+    db.close();
+    throw error;
+  }
+  const store = new FederatedReportStore(localStore, lan);
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", "loopback");
@@ -115,6 +145,10 @@ export async function createApplication(options = {}) {
       authenticationEnabled: auth.authenticationEnabled(),
       user: user ? publicUser(user) : null,
       dataRoot: user ? store.root : null,
+      dataScope: user ? lan.getSettings().epoch : null,
+      transientReports: Boolean(
+        user && lan.getSettings().mode === "host" && lan.getSettings().peer,
+      ),
       today: todayString(),
     });
   });
@@ -122,7 +156,7 @@ export async function createApplication(options = {}) {
   app.post("/api/auth/setup", auth.setup);
   app.post("/api/auth/login", auth.login);
   app.use("/api", auth.guard);
-  app.put("/api/access", auth.admin, auth.setAccess);
+  app.put("/api/access", auth.admin, requireLocalAdmin, auth.setAccess);
   app.post("/api/auth/logout", auth.logout);
   app.post("/api/auth/password", auth.changePassword);
   function assertCurrentIdentity(req) {
@@ -133,6 +167,18 @@ export async function createApplication(options = {}) {
       current.role !== req.user.role
     )
       throw httpError(401, "访问权限已变化，请重新连接");
+  }
+  function reportClient(req, required = false) {
+    const id = req.method === "GET" ? req.query.clientId : req.body.clientId;
+    if (id === undefined && !required) return undefined;
+    if (
+      typeof id !== "string" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(
+        id,
+      )
+    )
+      throw httpError(400, "报告会话标识无效，请刷新页面");
+    return `${req.user.id}:${id}`;
   }
   app.get("/api/reports", async (req, res) => {
     const page = Number(req.query.page ?? 1);
@@ -149,10 +195,24 @@ export async function createApplication(options = {}) {
       ...parseReportQuery(req.query),
       page,
       pageSize,
+      clientId: reportClient(req),
     });
     assertCurrentIdentity(req);
-    res.setHeader("Cache-Control", "private, no-cache");
+    res.setHeader(
+      "Cache-Control",
+      result.transient ? "no-store" : "private, no-cache",
+    );
     res.json(result);
+  });
+  app.post("/api/reports/lease", (req, res) => {
+    const clientId = reportClient(req, true);
+    if (req.body.release === true) store.release(clientId);
+    else store.touch(parseReportQuery(req.body), clientId);
+    res.json({ ok: true });
+  });
+  app.post("/api/reports/release", (req, res) => {
+    store.release(reportClient(req, true));
+    res.json({ ok: true });
   });
   app.post("/api/reports/export", async (req, res) => {
     const query = parseReportQuery(req.body);
@@ -186,15 +246,32 @@ export async function createApplication(options = {}) {
       await snapshot.close();
     }
   });
+  function publicLanStatus() {
+    const { mode, name, connected, lastError } = lan.getStatus();
+    return {
+      mode,
+      name,
+      connected,
+      lastError: lastError ? "局域网连接异常" : null,
+      listening: false,
+      peer: null,
+      addresses: [],
+      discovered: [],
+      pairing: { openUntil: null, pending: [] },
+      joining: null,
+    };
+  }
   function status() {
     return {
-      version: "2.1.2",
+      version: "2.2.0",
       ...store.status(),
       service: {
         mode: process.env.LIZI_SERVICE === "1" ? "service" : "standalone",
         uptime: Math.floor(process.uptime()),
       },
       remote: remote.getStatus(),
+      lan: publicLanStatus(),
+      cacheEpoch: lan.getSettings().epoch,
     };
   }
   app.get("/api/status", (req, res) => res.json(status()));
@@ -207,23 +284,85 @@ export async function createApplication(options = {}) {
     };
   }
   app.get("/api/settings", auth.admin, (req, res) => res.json(settings()));
-  app.put("/api/settings", auth.admin, async (req, res) => {
+  app.put("/api/settings", auth.admin, requireLocalAdmin, async (req, res) => {
     await store.setRoot(req.body.dataPath);
     res.json(settings());
   });
   app.get("/api/directories", auth.admin, async (req, res) =>
     res.json(await directories.browse(req.query.path)),
   );
-  app.post("/api/scan", auth.admin, async (req, res) => {
+  app.post("/api/scan", auth.admin, requireLocalAdmin, async (req, res) => {
     if (!store.root) throw httpError(400, "请先配置报告目录");
     void store
       .scan()
       .catch((error) => console.error("日期目录扫描失败：", error));
     res.status(202).json({ ok: true, scanning: true });
   });
-  app.put("/api/remote", auth.admin, async (req, res) => {
+  app.put("/api/remote", auth.admin, requireLocalAdmin, async (req, res) => {
     await remote.configure(req.body);
     res.json(settings());
+  });
+  function localLanAdministration(req) {
+    const address = req.socket.remoteAddress;
+    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address))
+      return false;
+    if (
+      Object.keys(req.headers).some(
+        (name) => name === "forwarded" || name.startsWith("x-forwarded-"),
+      )
+    )
+      return false;
+    try {
+      const hostname = new URL(`http://${req.headers.host}`).hostname;
+      return ["127.0.0.1", "localhost", "[::1]"].includes(hostname);
+    } catch {
+      return false;
+    }
+  }
+  function localAdminAuthorized(req) {
+    if (!localLanAdministration(req)) return false;
+    const presented = req.get("X-Lizi-Local-Admin");
+    if (!presented || !/^[A-Za-z0-9_-]{43}$/.test(presented)) return false;
+    const expected = Buffer.from(localAdminToken);
+    const actual = Buffer.from(presented);
+    return (
+      actual.length === expected.length && timingSafeEqual(actual, expected)
+    );
+  }
+  function requireLocalAdmin(req, res, next) {
+    if (!localAdminAuthorized(req))
+      return next(httpError(403, "仅本机桌面可以修改此配置"));
+    next();
+  }
+  function lanStatus(req) {
+    const canManage = localAdminAuthorized(req) && req.user?.role === "admin";
+    return { ...(canManage ? lan.getStatus() : publicLanStatus()), canManage };
+  }
+  const localLanOnly = requireLocalAdmin;
+  app.get("/api/lan", (req, res) => res.json(lanStatus(req)));
+  app.put("/api/lan", auth.admin, localLanOnly, async (req, res) => {
+    await lan.configure(req.body);
+    res.json(lanStatus(req));
+  });
+  for (const [route, action] of [
+    ["discover", "discover"],
+    ["pairing", "openPairing"],
+    ["join", "join"],
+    ["approve", "approve"],
+  ]) {
+    app.post(
+      `/api/lan/${route}`,
+      auth.admin,
+      localLanOnly,
+      async (req, res) => {
+        await lan[action](req.body);
+        res.json(lanStatus(req));
+      },
+    );
+  }
+  app.delete("/api/lan/peer", auth.admin, localLanOnly, async (req, res) => {
+    await lan.disconnect();
+    res.json(lanStatus(req));
   });
   app.get("/api/users", auth.admin, auth.listUsers);
   app.post("/api/users", auth.admin, auth.addUser);
@@ -334,9 +473,12 @@ export async function createApplication(options = {}) {
     port,
     db,
     store,
+    lan,
+    localStore,
     ready,
     async close() {
       for (const client of clients) client.res.end();
+      await lan.close();
       await store.close();
       await remote.stop();
       db.close();

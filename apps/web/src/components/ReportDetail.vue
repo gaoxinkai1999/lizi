@@ -25,6 +25,9 @@ const fields = [
 ];
 </script>
 <template>
+  <p class="report-source-label">
+    来源：{{ report.sourceName || report.sourceId || "本机" }}
+  </p>
   <div class="report-detail">
     <dl class="detail-grid">
       <div v-for="[key, label] in fields" :key="key">

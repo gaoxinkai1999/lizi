@@ -60,6 +60,7 @@ export async function createReportImages(reports, title, { signal } = {}) {
           150,
           130,
           200,
+          150,
           ...Array(count).fill(60),
           100,
           100,
@@ -87,6 +88,7 @@ export async function createReportImages(reports, title, { signal } = {}) {
           "日期",
           "时间",
           "样品",
+          "来源",
           ...Array.from({ length: count }, (_, index) =>
             String(testStart + index + 1),
           ),
@@ -107,6 +109,7 @@ export async function createReportImages(reports, title, { signal } = {}) {
             report.date,
             report.time,
             report.sampleName,
+            report.sourceName || report.sourceId || "本机",
             ...Array.from(
               { length: count },
               (_, i) => report.testResults?.[testStart + i]?.gram,

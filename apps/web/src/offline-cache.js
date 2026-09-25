@@ -125,6 +125,8 @@ export async function sessionScope(state) {
     state.user?.id,
     state.user?.role,
     state.dataRoot,
+    state.dataScope,
+    Boolean(state.transientReports),
   ]);
   if (!crypto.subtle) {
     cacheWarning(

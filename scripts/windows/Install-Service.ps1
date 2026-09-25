@@ -11,7 +11,7 @@ param(
 Assert-Administrator
 try {
     Start-LiziOperation 'install'
-    Set-LiziStage '[1/6] Checking packaged resources'
+    Set-LiziStage '[1/7] Checking packaged resources'
     if ($ReportRootFile) {
         if ($ReportRoot) { throw 'Specify ReportRoot or ReportRootFile, not both.' }
         $ReportRoot = Get-Content -LiteralPath $ReportRootFile -Raw
@@ -24,7 +24,7 @@ try {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Throw-LiziError "Missing packaged resource: $path. Run Prepare-Resources.ps1 before packaging." }
     }
 
-    Set-LiziStage '[2/6] Stopping the previous service and preparing directories (user data is preserved)'
+    Set-LiziStage '[2/7] Stopping the previous service and preparing directories (user data is preserved)'
     Stop-LiziService
     $DataHome = Get-LocalDirectory $DataHome -Create
     $sid = Get-BootstrapSid $BootstrapUserSid
@@ -49,7 +49,7 @@ try {
         if ($root.Equals($DataHome, [StringComparison]::OrdinalIgnoreCase)) { throw 'The report root cannot be the private data home.' }
     }
 
-    Set-LiziStage '[3/6] Checking LocalService directory ACLs (existing report grants are reused; missing grants or private-directory isolation can take time; no total installation timeout)'
+    Set-LiziStage '[3/7] Checking LocalService directory ACLs (existing report grants are reused; missing grants or private-directory isolation can take time; no total installation timeout)'
     $rootNumber = 0
     foreach ($root in $roots) {
         $rootNumber++
@@ -61,15 +61,17 @@ try {
         Write-LiziProgress ('Report directory {0} ACL policy checked ({1:N1}s); effective access is not verified.' -f $rootNumber, $aclWatch.Elapsed.TotalSeconds)
     }
 
-    # Only the interactive installing user can read this one file. No access to SQLite or FRP secrets.
-    $tokenPath = Join-Path $DataHome 'setup-token.txt'
-    if (-not (Test-Path -LiteralPath $tokenPath)) {
-        $bytes = New-Object byte[] 32
-        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-        Write-Utf8 $tokenPath ([Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'))
+    # Only the interactive installing user can read local desktop management credentials.
+    foreach ($credentialName in @('setup-token.txt', 'lan-admin-token.txt')) {
+        $tokenPath = Join-Path $DataHome $credentialName
+        if (-not (Test-Path -LiteralPath $tokenPath)) {
+            $bytes = New-Object byte[] 32
+            $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+            Write-Utf8 $tokenPath ([Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'))
+        }
+        Set-PrivateAcl $tokenPath $sid -Token
     }
-    Set-PrivateAcl $tokenPath $sid -Token
 
     # Service binaries/configuration must never be writable by its low-privilege account.
     Write-LiziProgress 'Protecting packaged programs and service configuration.'
@@ -123,7 +125,7 @@ try {
     }
     $xml.Save((Join-Path $runtime 'LiziService.xml'))
 
-    Set-LiziStage '[4/6] Registering the service (this explicit installation/upgrade enables normal Automatic startup, including a previously Disabled service)'
+    Set-LiziStage '[4/7] Registering the service (this explicit installation/upgrade enables normal Automatic startup, including a previously Disabled service)'
     if (Get-Service LiziService -ErrorAction SilentlyContinue) { Invoke-Native $wrapper @('uninstall') }
     Invoke-Native $wrapper @('install')
     Invoke-Native 'sc.exe' @('config', 'LiziService', 'start=', 'auto') -TimeoutSeconds 30
@@ -133,11 +135,13 @@ try {
     New-ItemProperty -LiteralPath $registryPath -Name 'DataHome' -Value $DataHome -PropertyType String -Force | Out-Null
     New-ItemProperty -LiteralPath $registryPath -Name 'AllowedRoots' -Value (ConvertTo-Json -InputObject @($roots) -Compress) -PropertyType String -Force | Out-Null
 
-    Set-LiziStage '[5/6] Starting LiziService as LocalService'
+    Set-LiziStage '[5/7] Configuring LocalSubnet LAN firewall rules (TCP 3211 and UDP 3212 only)'
+    Ensure-LiziLanFirewall (Join-Path $runtime 'node.exe')
+    Set-LiziStage '[6/7] Starting LiziService as LocalService'
     Start-LiziService
-    Set-LiziStage '[6/6] Checking local HTTP readiness (reports load on demand by selected date; readiness does not wait for historical indexing)'
+    Set-LiziStage '[7/7] Checking local HTTP readiness (reports load on demand by selected date; readiness does not wait for historical indexing)'
     Wait-LiziHealth
-    Set-LiziStage 'Installation complete. Reports are loaded on demand by date; accounts, settings and reports are preserved.'
+    Set-LiziStage 'Installation complete. LAN firewall rules are limited to LocalSubnet TCP 3211 and UDP 3212; choose the dual-machine role in Settings. Reports are loaded on demand by date; accounts, settings and reports are preserved.'
     Write-LiziProgress "Service logs: $logs"
 } catch {
     Write-LiziFailure $_

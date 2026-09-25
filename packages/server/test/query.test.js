@@ -45,13 +45,16 @@ test("date-scoped pages remain cacheable and cross-page/full exports preserve ag
     await runtime.close();
     await fs.rm(home, { recursive: true, force: true });
   });
-  await runtime.ready;
+  const localAdminToken = (
+    await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
+  ).trim();
   async function request(route, { method = "GET", body, headers = {} } = {}) {
     return fetch(`${origin}/api${route}`, {
       method,
       headers: {
         Origin: origin,
         "X-Lizi-Request": "1",
+        "X-Lizi-Local-Admin": localAdminToken,
         "Content-Type": "application/json",
         ...headers,
       },

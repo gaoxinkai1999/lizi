@@ -37,6 +37,8 @@ const verified = ref(false);
 const offlineSession = ref(false);
 const scope = ref("");
 const dataRoot = ref(null);
+const dataScope = ref("");
+const transientReports = ref(false);
 const initialQuery = ref(null);
 const cacheMessage = ref(getCacheWarning());
 const updateAvailable = ref(false);
@@ -72,6 +74,15 @@ function acceptRevision(value) {
   refreshKey.value++;
 }
 function acceptStatus(value) {
+  if (value.cacheEpoch !== undefined && dataScope.value) {
+    const expectedEpoch = String(dataScope.value).match(
+      /(?:^|[:.])([^:.]+)$/,
+    )?.[1];
+    if (expectedEpoch && String(value.cacheEpoch) !== expectedEpoch) {
+      refreshState();
+      return;
+    }
+  }
   if (value.root !== undefined && value.root !== dataRoot.value) {
     invalidateSession(new Event("lizi:data-root-changed"));
     return;
@@ -99,15 +110,24 @@ async function refreshState() {
       retries: 0,
     });
     if (sequence !== stateSequence) return;
-    const nextScope = await sessionScope(data);
+    const nextScope = await sessionScope({
+      ...data,
+      dataScope: data.dataScope || "",
+      transientReports: Boolean(data.transientReports),
+    });
     if (sequence !== stateSequence) return;
-    const changed =
-      nextScope !== scope.value ||
-      data.dataRoot !== dataRoot.value ||
+    const identityChanged =
       data.authenticationEnabled !== authenticationEnabled.value ||
+      Boolean(user.value) !== Boolean(data.user) ||
       (user.value &&
         (data.user?.id !== user.value.id ||
           data.user?.role !== user.value.role));
+    const topologyChanged =
+      nextScope !== scope.value ||
+      data.dataRoot !== dataRoot.value ||
+      data.dataScope !== dataScope.value ||
+      Boolean(data.transientReports) !== transientReports.value;
+    const changed = identityChanged || topologyChanged;
     if (changed) {
       const hadIdentity = Boolean(scope.value || user.value);
       stopSession();
@@ -115,7 +135,7 @@ async function refreshState() {
       offlineSession.value = false;
       user.value = null;
       status.value = null;
-      page.value = "reports";
+      if (identityChanged) page.value = "reports";
       if (hadIdentity) await clearReportCache();
       if (sequence !== stateSequence) return;
     }
@@ -124,6 +144,8 @@ async function refreshState() {
     today.value = data.today || localDate();
     user.value = data.user;
     dataRoot.value = data.dataRoot;
+    dataScope.value = data.dataScope || "";
+    transientReports.value = Boolean(data.transientReports);
     scope.value = nextScope;
     verified.value = true;
     offlineSession.value = false;
@@ -132,6 +154,8 @@ async function refreshState() {
       await saveSession({
         scope: nextScope,
         dataRoot: dataRoot.value,
+        dataScope: dataScope.value,
+        transientReports: transientReports.value,
         authenticationEnabled: data.authenticationEnabled,
         today: today.value,
         savedAt: Date.now(),
@@ -243,6 +267,8 @@ async function invalidateSession(event) {
   verified.value = false;
   offlineSession.value = false;
   scope.value = "";
+  dataScope.value = "";
+  transientReports.value = false;
   dataRoot.value = null;
   user.value = null;
   status.value = null;
@@ -300,6 +326,8 @@ onMounted(async () => {
   if (cached?.scope && !invalidating && initialSequence === stateSequence) {
     scope.value = cached.scope;
     dataRoot.value = cached.dataRoot;
+    dataScope.value = cached.dataScope || "";
+    transientReports.value = Boolean(cached.transientReports);
     authenticationEnabled.value = cached.authenticationEnabled;
     today.value = cached.today || localDate();
     initialQuery.value = cached.query;
@@ -425,6 +453,7 @@ onUnmounted(() => {
           :key="scope"
           :cache-scope="scope"
           :data-root="dataRoot"
+          :transient-reports="transientReports"
           @query-changed="initialQuery = $event"
           :initial-query="initialQuery"
           :online="verified"

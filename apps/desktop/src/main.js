@@ -11,6 +11,8 @@ import {
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const origin = "http://127.0.0.1:3210";
@@ -25,6 +27,168 @@ let quitting = false;
 let loading = false;
 let retryTimer;
 let waitingForBackend = false;
+let networkOperation = false;
+const executeFile = promisify(execFile);
+
+function assertTrustedSender(event) {
+  if (
+    !window ||
+    window.isDestroyed() ||
+    event.sender !== window.webContents ||
+    event.senderFrame !== window.webContents.mainFrame ||
+    !isTrusted(event.senderFrame.url)
+  )
+    throw new Error("不可信的页面");
+}
+
+function lanScriptPath() {
+  return app.isPackaged
+    ? join(process.resourcesPath, "service-scripts", "Configure-Lan.ps1")
+    : resolve(here, "../../../scripts/windows/Configure-Lan.ps1");
+}
+
+function powershellPath() {
+  if (process.platform !== "win32")
+    throw new Error("直连网卡向导仅支持 Windows");
+  return join(
+    process.env.SystemRoot || "C:\\Windows",
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
+}
+
+function quotePowerShell(value) {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+async function lanNetworkAdapters() {
+  try {
+    const { stdout } = await executeFile(
+      powershellPath(),
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        lanScriptPath(),
+        "-Action",
+        "List",
+      ],
+      {
+        windowsHide: true,
+        timeout: 30000,
+        maxBuffer: 256 * 1024,
+        encoding: "utf8",
+      },
+    );
+    const adapters = JSON.parse(stdout.replace(/^\uFEFF/, "").trim());
+    if (!Array.isArray(adapters)) throw new Error("Invalid adapter list");
+    return adapters;
+  } catch {
+    throw new Error("无法读取物理以太网网卡，请检查 Windows 网络管理组件");
+  }
+}
+
+const networkErrors = {
+  10: "所选网卡不可用或不是物理以太网网卡，未进行配置",
+  11: "所选网卡有默认路由，不能用作隔离直连网卡",
+  12: "所选网卡已使用静态 IPv4，为避免破坏原设置已拒绝操作",
+  13: "所选网卡已有其他 IPv4 设置，为避免破坏原设置已拒绝操作",
+  14: "所选网卡已有 DNS 设置，为避免破坏原设置已拒绝操作",
+  15: "其他网卡的地址或路由与 192.168.250.0/24 重叠，请选择其他直连方案",
+  16: "没有匹配此网卡的安全恢复记录，或网卡配置已变化；未删除其他配置",
+  17: "此网卡已有直连恢复记录，请先恢复自动 IP",
+  18: "直连地址冲突或未就绪，已恢复原自动 IP 设置",
+  19: "其他直连网卡操作正在进行，请稍后重试",
+  20: "配置失败且自动回滚未完成；已保留恢复记录，请再次使用恢复自动 IP，必要时联系管理员",
+};
+
+async function changeLanAdapter(event, parameters, restore = false) {
+  assertTrustedSender(event);
+  if (
+    !parameters ||
+    typeof parameters !== "object" ||
+    Array.isArray(parameters) ||
+    Object.keys(parameters).sort().join(",") !==
+      (restore ? "interfaceIndex" : "interfaceIndex,role") ||
+    !Number.isInteger(parameters.interfaceIndex) ||
+    parameters.interfaceIndex < 1 ||
+    parameters.interfaceIndex > 2147483647 ||
+    (!restore && !["host", "collector"].includes(parameters.role))
+  ) {
+    throw new Error("无效的网卡参数");
+  }
+  if (!app.isPackaged)
+    throw new Error("请使用已安装的桌面应用配置网卡；开发模式仅提供只读枚举");
+  if (networkOperation) throw new Error("网卡操作正在进行，请等待完成");
+  networkOperation = true;
+  try {
+    const adapter = (await lanNetworkAdapters()).find(
+      (item) => item.interfaceIndex === parameters.interfaceIndex,
+    );
+    if (!adapter) throw new Error("所选物理以太网网卡已不存在");
+    if (
+      restore
+        ? !adapter.canRestore
+        : !adapter.dhcpEnabled ||
+          adapter.hasDefaultRoute ||
+          adapter.hasNonApipaIPv4
+    ) {
+      throw new Error(
+        restore
+          ? "此网卡没有可恢复的直连记录"
+          : "请选择启用 DHCP、无默认路由且没有非 APIPA 地址的物理以太网网卡",
+      );
+    }
+    const address =
+      parameters.role === "host" ? "192.168.250.1" : "192.168.250.2";
+    const { response } = await dialog.showMessageBox(window, {
+      type: "warning",
+      title: restore ? "恢复自动 IP" : "配置专用直连网卡",
+      message: restore
+        ? `恢复“${adapter.name}”的自动 IP？`
+        : `将“${adapter.name}”配置为${parameters.role === "host" ? "主机 A" : "采集端 B"}直连网卡？`,
+      detail: restore
+        ? "仅删除本向导在同一物理网卡设置的直连地址并重新启用 DHCP。无 DHCP 服务器时由 Windows 自动生成 APIPA 地址；不会删除其他静态地址、网关或 DNS。随后将请求 Windows 管理员授权（UAC）。"
+        : `请确认此网卡仅用网线连接另一台电脑，不用于上网或仪器通信。将设置 ${address}/24，不设置网关或 DNS；保存原 DHCP/APIPA 状态，失败时回滚，并可通过“恢复自动 IP”撤销。不会修改其他网卡。随后将请求 Windows 管理员授权（UAC）。这不会开启双机监听，请另在设置中选择角色。`,
+      buttons: ["取消", restore ? "恢复并授权" : "配置并授权"],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    });
+    if (response !== 1) return { ok: false, cancelled: true };
+    assertTrustedSender(event);
+    const operation = restore ? "Restore" : "Configure";
+    const command = `& ${quotePowerShell(lanScriptPath())} -Action ${operation} -InterfaceIndex ${parameters.interfaceIndex}${restore ? "" : ` -Role ${parameters.role}`}; exit $LASTEXITCODE`;
+    const encoded = Buffer.from(command, "utf16le").toString("base64");
+    const elevate = `$ErrorActionPreference='Stop'; try { $p=Start-Process -FilePath ${quotePowerShell(powershellPath())} -ArgumentList '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode } catch { if ($_.Exception.NativeErrorCode -eq 1223) { exit 1223 }; exit 1 }`;
+    try {
+      // No timeout: never kill the helper halfway through a network transaction or rollback.
+      await executeFile(
+        powershellPath(),
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-EncodedCommand",
+          Buffer.from(elevate, "utf16le").toString("base64"),
+        ],
+        { windowsHide: true, maxBuffer: 4096 },
+      );
+    } catch (error) {
+      if (error.code === 1223) return { ok: false, cancelled: true };
+      throw new Error(
+        networkErrors[error.code] ||
+          "网卡操作失败。请检查管理员授权及 Windows 网络状态；若有恢复记录，请使用恢复自动 IP",
+      );
+    }
+    return { ok: true, cancelled: false };
+  } finally {
+    networkOperation = false;
+  }
+}
 
 function isTrusted(url) {
   try {
@@ -195,12 +359,7 @@ else {
         }
       }
       ipcMain.handle("lizi:get-setup-token", async (event) => {
-        if (
-          event.sender !== window?.webContents ||
-          event.senderFrame !== window.webContents.mainFrame ||
-          !isTrusted(event.senderFrame.url)
-        )
-          throw new Error("不可信的页面");
+        assertTrustedSender(event);
         const response = await fetch(`${origin}/api/auth/state`, {
           signal: AbortSignal.timeout(3000),
         });
@@ -212,6 +371,27 @@ else {
           throw new Error("无法读取本机初始化凭据，请联系安装管理员");
         }
       });
+      ipcMain.handle("lizi:get-local-admin-token", async (event) => {
+        assertTrustedSender(event);
+        try {
+          return (
+            await readFile(join(home, "lan-admin-token.txt"), "utf8")
+          ).trim();
+        } catch (error) {
+          if (error.code === "ENOENT") return null;
+          throw new Error("无法读取本机管理凭据，请联系安装管理员");
+        }
+      });
+      ipcMain.handle("lizi:lan-network-adapters", async (event) => {
+        assertTrustedSender(event);
+        return lanNetworkAdapters();
+      });
+      ipcMain.handle("lizi:configure-lan-adapter", (event, parameters) =>
+        changeLanAdapter(event, parameters),
+      );
+      ipcMain.handle("lizi:restore-lan-adapter", (event, parameters) =>
+        changeLanAdapter(event, parameters, true),
+      );
       createWindow();
       tray = new Tray(icon());
       tray.setToolTip("粒子报告 · 后台持续运行");

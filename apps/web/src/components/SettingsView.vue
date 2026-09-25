@@ -16,6 +16,7 @@ import {
 import QRCode from "qrcode";
 import { request } from "../api.js";
 import Modal from "./Modal.vue";
+import LanSettings from "./LanSettings.vue";
 const props = defineProps({
   user: Object,
   status: Object,
@@ -119,6 +120,7 @@ async function changeAccess() {
     await request("/access", {
       method: "PUT",
       body: { authenticationEnabled: !props.authenticationEnabled },
+      localAdmin: true,
     });
     accessOpen.value = false;
     emit("access-changed");
@@ -138,6 +140,7 @@ async function saveDirectory() {
       await request("/settings", {
         method: "PUT",
         body: { dataPath: dataPath.value.trim() },
+        localAdmin: true,
       }),
     );
     success.value = "报告根目录已保存，所选日期的数据将在后台按需准备。";
@@ -154,7 +157,7 @@ async function scan() {
   error.value = "";
   success.value = "";
   try {
-    await request("/scan", { method: "POST", body: {} });
+    await request("/scan", { method: "POST", body: {}, localAdmin: true });
     success.value =
       "已启动当前活跃日期的后台扫描，请查看下方进度；这不表示扫描已完成。";
     emit("refresh-status");
@@ -202,7 +205,7 @@ async function saveRemote(enabled) {
   };
   if (enabled && remote.token) body.token = remote.token;
   try {
-    await request("/remote", { method: "PUT", body });
+    await request("/remote", { method: "PUT", body, localAdmin: true });
     remote.token = "";
     await loadSettings();
     success.value = enabled
@@ -283,7 +286,7 @@ onUnmounted(() => {
         {{
           authenticationEnabled
             ? "使用账户登录后访问，账户与权限在账户页管理。"
-            : "打开链接即可使用全部功能，包括查看报告和修改设置。"
+            : "打开链接即可查看报告；局域网配对、目录和远程配置仅限本机粒子桌面。"
         }}
       </p>
       <button :disabled="!!busy" @click="accessOpen = true">
@@ -367,6 +370,7 @@ onUnmounted(() => {
         </details></template
       >
     </section>
+    <LanSettings v-if="props.user" />
     <template v-if="admin"
       ><p v-if="loading && !settings" class="notice">正在读取配置…</p>
       <div v-if="loadError" class="error-message" role="alert">

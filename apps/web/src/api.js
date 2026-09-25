@@ -12,6 +12,7 @@ export async function request(
     binary = false,
     timeout = binary ? 180_000 : 45_000,
     retries = method === "GET" ? 1 : 0,
+    localAdmin = false,
   } = {},
 ) {
   if (navigator.onLine === false || (method !== "GET" && !writesAllowed))
@@ -27,13 +28,18 @@ export async function request(
       controller.abort();
     }, timeout);
     try {
+      const headers = {
+        "X-Lizi-Request": "1",
+        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      };
+      if (localAdmin && window.liziDesktop?.getLocalAdminToken) {
+        const token = await window.liziDesktop.getLocalAdminToken();
+        if (token) headers["X-Lizi-Local-Admin"] = token;
+      }
       const response = await fetch(`/api${path}`, {
         method,
         credentials: "same-origin",
-        headers: {
-          "X-Lizi-Request": "1",
-          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-        },
+        headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
         cache: "no-store",

@@ -5,6 +5,12 @@ if (process.isMainFrame && window.location.origin === "http://127.0.0.1:3210") {
     "liziDesktop",
     Object.freeze({
       getSetupToken: () => ipcRenderer.invoke("lizi:get-setup-token"),
+      getLocalAdminToken: () =>
+        ipcRenderer.invoke("lizi:get-local-admin-token"),
+      configureLanAdapter: (parameters) =>
+        ipcRenderer.invoke("lizi:configure-lan-adapter", parameters),
+      restoreLanAdapter: (parameters) =>
+        ipcRenderer.invoke("lizi:restore-lan-adapter", parameters),
     }),
   );
 }

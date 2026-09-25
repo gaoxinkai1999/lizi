@@ -41,6 +41,7 @@ export async function exportReports(res, snapshot, date, shift) {
       width: 12,
     })),
     ...remaining.map(([key, header]) => ({ key, header, width: 18 })),
+    { key: "sourceName", header: "来源设备", width: 24 },
   ];
   const details = workbook.addWorksheet("全部测试明细", {
     views: [{ state: "frozen", ySplit: 1 }],
@@ -55,6 +56,7 @@ export async function exportReports(res, snapshot, date, shift) {
     ["test", "测试号", 12],
     ["gram", "硬度(g)", 14],
     ["mm", "直径(mm)", 14],
+    ["sourceName", "来源设备", 24],
   ].map(([key, header, width]) => ({ key, header, width }));
   const segments = workbook.addWorksheet("分段统计", {
     views: [{ state: "frozen", ySplit: 1 }],
@@ -64,6 +66,7 @@ export async function exportReports(res, snapshot, date, shift) {
     ["sampleName", "样品名称", 24],
     ["range", "范围", 18],
     ["stars", "分布", 40],
+    ["sourceName", "来源设备", 24],
   ].map(([key, header, width]) => ({ key, header, width }));
   for (const sheet of [summary, details, segments]) {
     sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" } };
@@ -93,6 +96,7 @@ export async function exportReports(res, snapshot, date, shift) {
         reportColumns.map(([key]) => [key, report[key]]),
       );
       row.isAggregate = report.isAggregate ? "是" : "否";
+      row.sourceName = report.sourceName || "本机";
       for (let index = 0; index < 20; index += 1)
         row[`test${index}`] = report.testResults[index]?.gram ?? null;
       summary.addRow(row).commit();
@@ -108,6 +112,7 @@ export async function exportReports(res, snapshot, date, shift) {
             time: report.time,
             line: report.line,
             sampleName: report.sampleName,
+            sourceName: report.sourceName || "本机",
             ...result,
           })
           .commit();
@@ -118,7 +123,12 @@ export async function exportReports(res, snapshot, date, shift) {
     for await (const report of snapshot.reports) {
       for (const result of report.segmentInfoList) {
         segments
-          .addRow({ id: report.id, sampleName: report.sampleName, ...result })
+          .addRow({
+            id: report.id,
+            sampleName: report.sampleName,
+            sourceName: report.sourceName || "本机",
+            ...result,
+          })
           .commit();
         await yieldRows();
       }

@@ -29,7 +29,7 @@ Function LiziReportDirectory
   ${NSD_CreateBrowseButton} 84% 47u 16% 16u "浏览"
   Pop $0
   ${NSD_OnClick} $0 LiziBrowseReportDirectory
-  ${NSD_CreateLabel} 0 80u 100% 52u "安装需管理员权限。后台随系统正常自动启动；关闭桌面不停止后台。报告按所选日期按需加载，健康就绪无需等待历史索引。卸载保留账户、设置和数据。以后可用 Set-ReportRoots.ps1 授权其他目录。"
+  ${NSD_CreateLabel} 0 80u 100% 66u "安装需管理员权限。后台随系统启动；关闭桌面不停止后台。报告按日期按需加载。双机请安装后在设置选择角色；安装仅允许内置程序的同网段 TCP 3211 / UDP 3212，不开放 HTTP 3210，不开启 LAN、不修改网卡。专用直连网卡需手动确认与 UAC 授权。卸载保留账户、设置和数据，并仅移除上述两条防火墙规则。其他报告目录可用 Set-ReportRoots.ps1 授权。"
   Pop $0
   nsDialogs::Show
 FunctionEnd
@@ -55,6 +55,7 @@ FunctionEnd
   SetDetailsView show
   DetailPrint "正在检查资源、准备目录并注册后台。目录权限继承可能耗时；各阶段及耗时会显示在下方。"
   DetailPrint "安装日志：$APPDATA\LiziInstaller\install.log（管理员可读取，不包含凭据）"
+  DetailPrint "双机：设置中选择主机 A / 采集端 B。默认不启用 LAN、不修改 IP；仅为内置 node.exe 添加同网段 TCP 3211 / UDP 3212 入站规则（含 Public 网络）。"
   ${If} $LiziReportRoot == ""
     StrCpy $LiziReportRoot "$APPDATA\Lizi\reports"
   ${EndIf}

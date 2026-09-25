@@ -29,6 +29,9 @@ async function fixture(t) {
     await runtime.close();
   }
   await start();
+  const localAdminToken = (
+    await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
+  ).trim();
   t.after(async () => {
     await stop();
     await fs.rm(home, { recursive: true, force: true });
@@ -59,6 +62,7 @@ async function fixture(t) {
         method: "PUT",
         body: { authenticationEnabled },
         cookie,
+        headers: { "X-Lizi-Local-Admin": localAdminToken },
       }),
     async restart() {
       await stop();
@@ -68,6 +72,49 @@ async function fixture(t) {
 }
 
 const password = "a-password-long-enough";
+
+test("LAN configuration remains local-only even when the report site is public", async (t) => {
+  const { request, home } = await fixture(t);
+  const local = await (await request("/api/lan")).json();
+  assert.equal(local.canManage, false);
+  assert.deepEqual(local.addresses, []);
+  assert.deepEqual(local.discovered, []);
+  assert.equal(local.peer, null);
+  const managed = await (
+    await request("/api/lan", {
+      headers: {
+        "X-Lizi-Local-Admin": (
+          await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
+        ).trim(),
+      },
+    })
+  ).json();
+  assert.equal(managed.canManage, true);
+  for (const headers of [
+    { "X-Forwarded-For": "192.168.10.20" },
+    { Forwarded: "for=192.168.10.20" },
+    { Host: "reports.example", Origin: "http://reports.example" },
+  ]) {
+    const response = await request("/api/lan", {
+      method: "PUT",
+      body: { mode: "collector", name: "unauthorized" },
+      headers,
+    });
+    assert.equal(response.status, 403);
+    const status = await (await request("/api/lan", { headers })).json();
+    assert.equal(status.canManage, false);
+    assert.equal(status.mode, "standalone");
+  }
+  assert.equal(
+    (
+      await request("/api/reports/lease", {
+        method: "POST",
+        body: { clientId: "invalid" },
+      })
+    ).status,
+    400,
+  );
+});
 
 test("bootstrap needs a token and same-origin marker; sessions enforce role and immediate disable", async (t) => {
   const { request, token, setAccess } = await fixture(t);
@@ -193,13 +240,28 @@ test("public access serves reports and administration without cookies but reject
       await request("/api/settings", {
         method: "PUT",
         body: { dataPath: root },
+        headers: {
+          "X-Lizi-Local-Admin": (
+            await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
+          ).trim(),
+        },
       })
     ).status,
     200,
   );
   assert.equal((await request("/api/directories")).status, 200);
   assert.equal(
-    (await request("/api/scan", { method: "POST", body: {} })).status,
+    (
+      await request("/api/scan", {
+        method: "POST",
+        body: {},
+        headers: {
+          "X-Lizi-Local-Admin": (
+            await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
+          ).trim(),
+        },
+      })
+    ).status,
     202,
   );
   let reports;
@@ -265,6 +327,11 @@ test("public access serves reports and administration without cookies but reject
       await request("/api/access", {
         method: "PUT",
         body: { authenticationEnabled: "true" },
+        headers: {
+          "X-Lizi-Local-Admin": (
+            await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
+          ).trim(),
+        },
       })
     ).status,
     400,

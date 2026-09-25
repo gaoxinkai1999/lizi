@@ -298,6 +298,15 @@ label {
   color: #51716e;
   background: #eef5f3;
 }
+.source-badge {
+  background: #eef3f8;
+  color: #53667a;
+}
+.report-source-label {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 14px;
+}
 .status-dot,
 .connection i {
   display: inline-block;

@@ -218,6 +218,30 @@ function Write-Utf8([string] $Path, [string] $Content) {
     [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+function Ensure-LiziLanFirewall([string] $NodePath) {
+    if (-not $NodePath -or -not (Test-Path -LiteralPath $NodePath -PathType Leaf)) {
+        Throw-LiziError 'Packaged node.exe is required before configuring the LAN firewall rules.'
+    }
+    if (-not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        Throw-LiziError 'Windows Firewall cmdlets are unavailable; LAN firewall rules were not configured.'
+    }
+    $rules = @(
+        @{ Name = 'Lizi-LAN-TCP-3211'; DisplayName = 'Lizi LAN pair/data TCP 3211'; Protocol = 'TCP'; Port = '3211' },
+        @{ Name = 'Lizi-LAN-UDP-3212'; DisplayName = 'Lizi LAN discovery UDP 3212'; Protocol = 'UDP'; Port = '3212' }
+    )
+    foreach ($rule in $rules) {
+        Get-NetFirewallRule -Name $rule.Name -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop
+        New-NetFirewallRule -Name $rule.Name -DisplayName $rule.DisplayName -Description 'Lizi local-subnet LAN direct-link traffic only.' -Direction Inbound -Action Allow -Enabled True -Profile Any -Program $NodePath -Protocol $rule.Protocol -LocalPort $rule.Port -RemoteAddress LocalSubnet -EdgeTraversalPolicy Block | Out-Null
+    }
+}
+
+function Remove-LiziLanFirewall {
+    if (-not (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) { Throw-LiziError 'Windows Firewall cmdlets are unavailable; Lizi LAN firewall rules could not be removed.' }
+    foreach ($name in @('Lizi-LAN-TCP-3211', 'Lizi-LAN-UDP-3212')) {
+        Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction Stop
+    }
+}
+
 function Stop-LiziService {
     $service = Get-Service -Name LiziService -ErrorAction SilentlyContinue
     if ($service -and $service.Status -ne 'Stopped') {

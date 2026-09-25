@@ -23,10 +23,15 @@ const props = defineProps({
   online: Boolean,
   active: Boolean,
   cacheScope: String,
+  transientReports: Boolean,
   dataRoot: String,
   initialQuery: Object,
   scanStatus: Object,
 });
+const clientId = crypto.randomUUID();
+function requestQuery(snapshot) {
+  return { ...snapshot, clientId };
+}
 const emit = defineEmits(["query-changed"]);
 const query = reactive({
   date: props.initialQuery?.date || props.today || localDate(),
@@ -48,6 +53,12 @@ const hasSelection = computed(
 );
 const loading = ref(false);
 const error = ref("");
+const sourceWarnings = ref([]);
+const sources = ref([]);
+const transient = ref(false);
+const cacheAllowed = computed(
+  () => !props.transientReports && !transient.value,
+);
 const actionError = ref("");
 const notice = ref("");
 const cached = ref(false);
@@ -76,6 +87,8 @@ const pageCount = computed(() =>
 let controller,
   imageController,
   exportController,
+  leaseTimer,
+  leaseScope = "",
   activeKey = "",
   sequence = 0,
   pendingRefresh = false;
@@ -116,6 +129,12 @@ const scanErrors = computed(() => {
     .slice(0, 3);
 });
 const emptyState = computed(() => {
+  if (!props.online && props.transientReports)
+    return {
+      title: "双机页面已断线",
+      description:
+        "当前结果只保留在内存中，连接恢复后才能继续获取报告；不会把断线状态当成零份报告。",
+    };
   if (!props.online)
     return {
       title: "此缓存页中没有报告",
@@ -160,6 +179,9 @@ const readyForActions = computed(() =>
 );
 function displayResult(result, snapshot, savedAt, fromCache) {
   reports.value = result.reports;
+  transient.value = Boolean(props.transientReports || result.transient);
+  sources.value = result.sources || [];
+  sourceWarnings.value = result.warnings || [];
   total.value = result.total;
   indexing.value = Boolean(result.indexing);
   loadedQuery.value = snapshot;
@@ -168,6 +190,61 @@ function displayResult(result, snapshot, savedAt, fromCache) {
   if (detail.value)
     detail.value =
       result.reports.find((report) => report.id === detail.value.id) || null;
+}
+function leasePayload(snapshot, release = false) {
+  return {
+    clientId,
+    date: snapshot?.date || query.date,
+    shift: snapshot?.shift || query.shift,
+    excludeAggregate: Boolean(
+      snapshot?.excludeAggregate ?? query.excludeAggregate,
+    ),
+    ...(release ? { release: true } : {}),
+  };
+}
+async function touchLease() {
+  if (!props.online || !props.active || document.visibilityState !== "visible")
+    return;
+  const snapshot = loadedQuery.value || query;
+  if (!snapshot?.date || !snapshot?.shift) return;
+  const nextScope = JSON.stringify(leasePayload(snapshot));
+  try {
+    await request("/reports/lease", {
+      method: "POST",
+      body: leasePayload(snapshot),
+      retries: 0,
+      timeout: 8_000,
+    });
+    leaseScope = nextScope;
+  } catch {
+    /* A lease is advisory; report loading remains usable when it cannot be renewed. */
+  }
+}
+function scheduleLease() {
+  clearInterval(leaseTimer);
+  leaseTimer = null;
+  if (props.online && props.active && document.visibilityState === "visible") {
+    touchLease();
+    leaseTimer = setInterval(touchLease, 30_000);
+  }
+}
+async function releaseLease() {
+  clearInterval(leaseTimer);
+  leaseTimer = null;
+  if (!leaseScope) return;
+  const payload = leasePayload(loadedQuery.value || query, true);
+  leaseScope = "";
+  try {
+    await fetch("/api/reports/release", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Lizi-Request": "1" },
+      body: JSON.stringify({ clientId: payload.clientId }),
+      keepalive: true,
+    });
+  } catch {
+    /* Pagehide/unmount cannot safely retry a release. */
+  }
 }
 async function loadReports() {
   const snapshot = { ...query };
@@ -183,6 +260,9 @@ async function loadReports() {
     openDetails.value = new Set();
     detail.value = null;
     loadedAt.value = "";
+    transient.value = Boolean(props.transientReports);
+    sourceWarnings.value = [];
+    sources.value = [];
     error.value = "";
   }
   activeKey = key;
@@ -198,7 +278,7 @@ async function loadReports() {
   loading.value = true;
   error.value = "";
   try {
-    if (!loadedQuery.value) {
+    if (!loadedQuery.value && cacheAllowed.value) {
       const saved = await readReportPage(props.cacheScope, snapshot);
       if (current !== sequence) return;
       if (saved) displayResult(saved.data, snapshot, saved.savedAt, true);
@@ -214,20 +294,25 @@ async function loadReports() {
       pendingRefresh = true;
       return;
     }
-    const result = await request(`/reports?${new URLSearchParams(snapshot)}`, {
-      signal,
-    });
+    const result = await request(
+      `/reports?${new URLSearchParams(requestQuery(snapshot))}`,
+      {
+        signal,
+      },
+    );
     if (current !== sequence) return;
     if (result.root !== props.dataRoot) {
       window.dispatchEvent(new Event("lizi:data-root-changed"));
       return;
     }
     displayResult(result, snapshot, Date.now(), false);
+    scheduleLease();
     if (snapshot.page > pageCount.value && !result.indexing) {
       query.page = pageCount.value;
       return;
     }
-    await saveReportPage(props.cacheScope, snapshot, result);
+    if (cacheAllowed.value)
+      await saveReportPage(props.cacheScope, snapshot, result);
   } catch (cause) {
     if (current === sequence && cause.name !== "AbortError")
       error.value = cause.message;
@@ -260,6 +345,8 @@ watch(
     imageOpen.value = false;
     notice.value = "";
     actionError.value = "";
+    loadedQuery.value = null;
+    releaseLease().finally(scheduleLease);
   },
   { flush: "sync" },
 );
@@ -282,13 +369,18 @@ watch(
   () => props.active,
   (active) => {
     if (active && pendingRefresh) loadReports();
+    if (active) scheduleLease();
+    else releaseLease();
   },
 );
 function resume() {
-  if (document.visibilityState === "visible" && props.active && pendingRefresh)
-    loadReports();
+  if (document.visibilityState === "visible") {
+    scheduleLease();
+    if (props.active && pendingRefresh) loadReports();
+  } else releaseLease();
 }
 document.addEventListener("visibilitychange", resume);
+window.addEventListener("pagehide", releaseLease);
 function toggle(id) {
   if (wholeQuery.value) return;
   const next = new Set(selected.value);
@@ -396,19 +488,21 @@ async function* imageReports(snapshot, chosen, entire, signal) {
     };
     let result;
     if (props.online)
-      result = await request(`/reports?${new URLSearchParams(params)}`, {
-        signal,
-      });
+      result = await request(
+        `/reports?${new URLSearchParams(requestQuery(params))}`,
+        {
+          signal,
+        },
+      );
     else {
-      // Offline selection uses exactly the cached query, filtering aggregates locally.
+      if (!cacheAllowed.value)
+        throw new Error(
+          "双机报告只保留在内存中，断线后不能生成离线图片；请连接主机后重试。",
+        );
       const saved = await readReportPage(props.cacheScope, {
         ...params,
         excludeAggregate: snapshot.excludeAggregate,
       });
-      if (!saved)
-        throw new Error(
-          `第 ${page} 页未缓存，无法生成完整图片。请联网后重试。`,
-        );
       result = saved.data;
     }
     if (result.indexing)
@@ -486,9 +580,11 @@ onUnmounted(() => {
   controller?.abort();
   imageController?.abort();
   exportController?.abort();
+  releaseLease();
   releaseImages();
   mobileViewport.removeEventListener("change", updateViewport);
   document.removeEventListener("visibilitychange", resume);
+  window.removeEventListener("pagehide", releaseLease);
 });
 </script>
 
@@ -578,6 +674,23 @@ onUnmounted(() => {
         </select></label
       >
     </div>
+    <p v-if="transient" class="notice" role="status">
+      双机报告仅保留在本页面内存中，断线后显示的是最后一次已获取的结果；不会写入离线缓存。
+    </p>
+    <div v-if="sourceWarnings.length" class="error-message" role="alert">
+      <strong>报告来源存在暂时问题，数量不能视为完整：</strong>
+      <p v-for="warning in sourceWarnings" :key="warning">{{ warning }}</p>
+    </div>
+    <p v-if="sources.length" class="field-help report-sources">
+      来源：<span v-for="(source, index) in sources" :key="source.id"
+        >{{ index ? "、" : "" }}{{ source.name || source.id
+        }}{{
+          source.state && source.state !== "online"
+            ? `（${source.warning || "暂时不可用"}）`
+            : ""
+        }}</span
+      >
+    </p>
     <p
       v-if="online && (indexing || scanStatus?.scanning)"
       class="notice"
@@ -712,8 +825,12 @@ onUnmounted(() => {
                   ></span
                 ></label
               ><span v-if="report.isAggregate" class="badge">总分析</span
+              ><span class="badge source-badge"
+                >来源：{{
+                  report.sourceName || report.sourceId || "本机"
+                }}</span
               ><span
-                v-else-if="report.line !== null && report.line !== undefined"
+                v-if="report.line !== null && report.line !== undefined"
                 class="line-badge"
                 >{{ report.line }} 线</span
               >
@@ -767,6 +884,7 @@ onUnmounted(() => {
                 <th>时间</th>
                 <th>产线</th>
                 <th>样品</th>
+                <th>来源</th>
                 <th class="average-column">平均 / g</th>
                 <th>最大 / g</th>
                 <th>最小 / g</th>
@@ -800,6 +918,7 @@ onUnmounted(() => {
                     title="总分析"
                   />{{ report.sampleName }}
                 </td>
+                <td>{{ report.sourceName || report.sourceId || "本机" }}</td>
                 <td class="average-column">
                   {{ showValue(report.averageHardness) }}
                 </td>
@@ -835,7 +954,11 @@ onUnmounted(() => {
                       : `${report.line} 线`
                   }}
                 </h3>
-                <p>{{ report.sampleName }}</p>
+                <p>
+                  {{ report.sampleName }} · 来源：{{
+                    report.sourceName || report.sourceId || "本机"
+                  }}
+                </p>
                 <time>{{ report.date }} {{ report.time }}</time>
               </div>
               <label class="check-target"
