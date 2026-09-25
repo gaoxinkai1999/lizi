@@ -599,7 +599,7 @@ function queryFilter(query, selected = false) {
     ],
   };
 }
-const ordering = "ORDER BY line IS NULL,line,timestamp,id";
+const ordering = "ORDER BY timestamp,id";
 
 function queryReports(query) {
   const scopes = activate(query);

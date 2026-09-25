@@ -85,9 +85,18 @@ test("shift boundaries do not duplicate 19:00 or include next-day 07:00 across l
   ]);
 });
 
-test("production line sorting is numeric and aggregate exclusion is case insensitive", () => {
-  const reports = ["10 样品", "2 样品", "1 Z", "3 总分析"].map((sample) =>
-    parseReport(zeroReport.replace("10 零值样品", sample)),
+test("reports sort by time across production lines and exclude aggregates case insensitively", () => {
+  const reports = [
+    ["2 样品", "09"],
+    ["10 样品", "08"],
+    ["1 Z", "07"],
+    ["3 总分析", "10"],
+  ].map(([sample, hour]) =>
+    parseReport(
+      zeroReport
+        .replace("10 零值样品", sample)
+        .replace("_7-0-0", `_${hour}-0-0`),
+    ),
   );
   assert.deepEqual(
     filterReports(reports, {
@@ -95,7 +104,7 @@ test("production line sorting is numeric and aggregate exclusion is case insensi
       shift: "full",
       excludeAggregate: true,
     }).map((row) => row.line),
-    [2, 10],
+    [10, 2],
   );
 });
 

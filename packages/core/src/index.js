@@ -84,7 +84,6 @@ export function filterReports(
     })
     .sort(
       (a, b) =>
-        (a.line ?? Infinity) - (b.line ?? Infinity) ||
         `${a.date}T${a.time}`.localeCompare(`${b.date}T${b.time}`) ||
         String(a.id ?? "").localeCompare(String(b.id ?? "")),
     );

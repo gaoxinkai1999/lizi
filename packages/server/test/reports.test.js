@@ -74,7 +74,11 @@ test("startup/root selection never indexes history; date queries expose bounded 
   for (let index = 0; index < 160; index += 1) {
     await stableWrite(
       path.join(root, query.date, "instrument", `${index}.txt`),
-      report(`${index} A`),
+      report(
+        `${index} A`,
+        query.date,
+        `07-${String(Math.floor((159 - index) / 60)).padStart(2, "0")}-${String((159 - index) % 60).padStart(2, "0")}`,
+      ),
     );
   }
   await stableWrite(
@@ -109,9 +113,9 @@ test("startup/root selection never indexes history; date queries expose bounded 
   const second = await store.query({ ...query, page: 2, pageSize: 25 });
   assert.equal(first.total, 160);
   assert.equal(first.reports.length, 25);
-  assert.equal(first.reports[0].sampleName, "0 A");
+  assert.equal(first.reports[0].sampleName, "159 A");
   assert.equal(first.reports[0].averageHardness, 0);
-  assert.equal(second.reports[0].sampleName, "25 A");
+  assert.equal(second.reports[0].sampleName, "134 A");
   assert.ok(
     counts.some((count) => count > 0 && count < 160),
     "committed pages become visible before the date finishes",
@@ -202,7 +206,7 @@ test("night/full activate two date directories and preserve aggregate export sel
   );
   await stableWrite(
     path.join(root, query.date, "machine", "night.txt"),
-    report("2 night", query.date, "20-00-00"),
+    report("9 night", query.date, "20-00-00"),
   );
   await stableWrite(
     path.join(root, "2026-09-24", "machine", "morning.txt"),
@@ -219,7 +223,7 @@ test("night/full activate two date directories and preserve aggregate export sel
   assert.equal(snapshot.count, 2);
   assert.equal(snapshot.detailCount, 2);
   const before = (await collect(snapshot)).map((row) => row.sampleName);
-  assert.deepEqual(before, ["2 night", "3 morning"]);
+  assert.deepEqual(before, ["9 night", "3 morning"]);
   await stableWrite(
     path.join(root, query.date, "machine", "night.txt"),
     report("2 changed", query.date, "20-00-00"),
