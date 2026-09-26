@@ -7,6 +7,7 @@ if (process.isMainFrame && window.location.origin === "http://127.0.0.1:3210") {
       getSetupToken: () => ipcRenderer.invoke("lizi:get-setup-token"),
       getLocalAdminToken: () =>
         ipcRenderer.invoke("lizi:get-local-admin-token"),
+      lanNetworkAdapters: () => ipcRenderer.invoke("lizi:lan-network-adapters"),
       configureLanAdapter: (parameters) =>
         ipcRenderer.invoke("lizi:configure-lan-adapter", parameters),
       restoreLanAdapter: (parameters) =>

@@ -263,7 +263,7 @@ export async function createApplication(options = {}) {
   }
   function status() {
     return {
-      version: "2.2.0",
+      version: "2.2.1",
       ...store.status(),
       service: {
         mode: process.env.LIZI_SERVICE === "1" ? "service" : "standalone",

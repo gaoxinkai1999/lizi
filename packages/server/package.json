@@ -1,6 +1,6 @@
 {
   "name": "@lizi/server",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "@lizi/core": "2.2.0",
+    "@lizi/core": "2.2.1",
     "compression": "^1.8.1",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",

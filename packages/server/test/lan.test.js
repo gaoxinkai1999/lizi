@@ -220,6 +220,84 @@ test(
   },
 );
 
+test("主机在批准前重启且双方在批准后重启仍可完成配对和撤销", async (t) => {
+  const a = await fixture(t);
+  const b = await fixture(t);
+  const host = await a.manager();
+  const collector = await b.manager();
+  await collector.configure({ mode: "collector", name: "采集端B" });
+  await host.configure({ mode: "host", name: "主机A" });
+  const hostId = host.getSettings().deviceId;
+  const port = collector.getSettings().port;
+  const discovered = await host.discover({ address: "127.0.0.1", port });
+  await collector.openPairing();
+  await host.join(discovered.discovered[0]);
+  const pending = collector.getStatus().pairing.pending[0];
+  await host.close();
+  const waiting = await a.manager();
+  assert.equal(waiting.getStatus().joining?.code, pending.code);
+  await waiting.close();
+  await collector.approve({ id: pending.id, code: pending.code });
+  await collector.close();
+  const restartedCollector = await b.manager({ port });
+  await restartedCollector.start();
+  const restartedHost = await a.manager();
+  await waitUntil(
+    () => restartedHost.getStatus().connected,
+    "中断的握手未恢复",
+  );
+  await writeReport(b.root, 1, "重启后报告");
+  const snapshot = await restartedHost.fetchReports(query);
+  assert.equal(snapshot.reports[0].sampleName, "重启后报告");
+  await restartedCollector.disconnect();
+  await waitUntil(() => !restartedHost.getSettings().peer, "撤销未传播");
+  await restartedHost.close();
+  const revoked = await a.manager();
+  assert.equal(revoked.getSettings().deviceId, hostId);
+  assert.equal(revoked.getSettings().mode, "host");
+  assert.equal(revoked.getStatus().joining, null);
+  assert.equal(revoked.getSettings().peer, null);
+  await pair(revoked, restartedCollector);
+});
+
+test("取消及过期的主机握手不会在重启后恢复", async (t) => {
+  const a = await fixture(t);
+  const b = await fixture(t);
+  const host = await a.manager();
+  const collector = await b.manager();
+  await collector.configure({ mode: "collector" });
+  await host.configure({ mode: "host" });
+  const discovered = await host.discover({
+    address: "127.0.0.1",
+    port: collector.getSettings().port,
+  });
+  await collector.openPairing();
+  await host.join(discovered.discovered[0]);
+  await host.disconnect();
+  await host.close();
+  const cancelled = await a.manager();
+  assert.equal(cancelled.getStatus().joining, null);
+  const port = collector.getSettings().port;
+  await collector.close();
+  const freshCollector = await b.manager({ port });
+  await freshCollector.openPairing();
+  await cancelled.join(discovered.discovered[0]);
+  await cancelled.close();
+  const file = path.join(a.home, "lan-settings.json");
+  const saved = JSON.parse(await fs.readFile(file, "utf8"));
+  saved.joining.expiresAt = Date.now() - 1000;
+  await fs.writeFile(file, JSON.stringify(saved));
+  const expired = await a.manager();
+  await waitUntil(
+    () => expired.getStatus().joining?.status === "expired",
+    "握手未过期",
+  );
+  assert.equal(expired.getSettings().peer, null);
+  await expired.close();
+  const restarted = await a.manager();
+  assert.equal(restarted.getStatus().joining, null);
+});
+
 test(
   "错证书在发送Bearer前失败，不能向攻击端泄露认证头",
   { timeout: 30_000 },

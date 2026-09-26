@@ -152,6 +152,19 @@ class LanManager extends EventEmitter {
       )
         throw new Error("局域网配置损坏，请恢复lan-settings.json");
       deviceName(saved.name);
+      if (saved.peer) this.validatePeer(saved.peer);
+      if (saved.joining && saved.mode === "host" && !saved.peer) {
+        const joining = saved.joining;
+        this.validatePeer(joining);
+        if (
+          !/^[A-Za-z0-9_-]{43}$/.test(joining.ticket) ||
+          !/^[A-F0-9]{4}(?:-[A-F0-9]{4}){3}$/.test(joining.code) ||
+          !Number.isFinite(joining.expiresAt) ||
+          joining.status !== "pending"
+        )
+          throw new Error("局域网配对状态损坏，请恢复lan-settings.json");
+        this.joining = { ...joining };
+      }
       if (saved.pairing !== null && saved.pairing !== undefined) {
         if (
           !saved.pairing ||
@@ -369,6 +382,12 @@ class LanManager extends EventEmitter {
     }
     if (this.state.mode === "host" && this.state.peer && !this.eventJob)
       this.scheduleReconnect(0);
+    if (
+      this.state.mode === "host" &&
+      !this.state.peer &&
+      this.joining?.status === "pending"
+    )
+      this.scheduleJoinPoll();
     this.emit("status");
   }
 
@@ -396,6 +415,7 @@ class LanManager extends EventEmitter {
         mode,
         name: nextName,
         pairing: changedMode ? null : this.state.pairing,
+        joining: changedMode ? null : this.state.joining,
         epoch: this.state.epoch + 1,
       });
       try {
@@ -661,13 +681,15 @@ class LanManager extends EventEmitter {
         port: peer.port,
         fingerprint: peer.fingerprint,
       });
-      this.joining = {
+      const joining = {
         ...collector,
         ticket: result.ticket,
         expiresAt: result.expiresAt,
         status: "pending",
         code: safetyCode(peer.fingerprint, this.identity.publicKey, nonce),
       };
+      await this.save({ ...this.state, joining }, false);
+      this.joining = { ...joining };
       this.emit("status");
       this.scheduleJoinPoll();
       return this.getStatus();
@@ -683,12 +705,21 @@ class LanManager extends EventEmitter {
     this.joinTimer.unref();
   }
 
+  finishJoin(joining, status) {
+    return this.mutate(async () => {
+      if (this.joining !== joining || this.state.peer) return;
+      await this.save({ ...this.state, joining: null }, false);
+      joining.status = status;
+      delete joining.ticket;
+      this.emit("status");
+    });
+  }
+
   async pollJoin() {
     const joining = this.joining;
     if (this.closed || !joining || joining.status !== "pending") return;
     if (joining.expiresAt <= Date.now()) {
-      joining.status = "expired";
-      this.emit("status");
+      await this.finishJoin(joining, "expired");
       return;
     }
     try {
@@ -718,6 +749,7 @@ class LanManager extends EventEmitter {
         await this.save({
           ...this.state,
           peer: { ...publicPeer(joining), token },
+          joining: null,
           epoch: this.state.epoch + 1,
         });
         joining.status = "approved";
@@ -729,8 +761,7 @@ class LanManager extends EventEmitter {
       if (this.joining !== joining || this.closed) return;
       this.fail(error);
       if ([403, 404, 410, 495].includes(error.status)) {
-        joining.status = "failed";
-        this.emit("status");
+        await this.finishJoin(joining, "failed");
       } else this.scheduleJoinPoll();
     }
   }
@@ -812,8 +843,6 @@ class LanManager extends EventEmitter {
           Buffer.from(token),
         )
         .toString("base64");
-      pending.approved = encryptedToken;
-      pending.key = null;
       await this.save({
         ...this.state,
         peer: { ...publicPeer(pending), tokenHash: tokenHash(token) },
@@ -825,6 +854,8 @@ class LanManager extends EventEmitter {
         },
         epoch: this.state.epoch + 1,
       });
+      pending.approved = encryptedToken;
+      pending.key = null;
       this.openUntil = 0;
       this.emit("status");
       return this.getStatus();
@@ -871,6 +902,7 @@ class LanManager extends EventEmitter {
         ...this.state,
         peer: null,
         pairing: null,
+        joining: null,
         epoch: this.state.epoch + 1,
       });
       await this.releaseCollector();
@@ -1217,6 +1249,7 @@ class LanManager extends EventEmitter {
         ...this.state,
         peer: null,
         pairing: null,
+        joining: null,
         epoch: this.state.epoch + 1,
       });
       await this.releaseCollector();
