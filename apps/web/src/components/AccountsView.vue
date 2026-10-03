@@ -265,7 +265,7 @@ onMounted(loadUsers);
             <option value="viewer">报告查看者</option>
             <option value="admin">管理员</option></select
           ><span class="field-help"
-            >报告查看者可以查询、导出、生成图片及修改自己的密码；管理员可额外管理目录、远程访问和账户。</span
+            >报告查看者可以查询、导出、生成图片及修改自己的密码；管理员可额外管理账户和设备。采集电脑的目录、局域网及上传配置仍需本机管理权限。</span
           ></label
         ><label
           >{{ editingId !== null ? "重置密码（可选）" : "初始密码"

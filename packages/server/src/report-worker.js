@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { decodeReport, parseReport, shiftBounds } from "@lizi/core";
 import { getSetting, setSetting, transaction } from "./database.js";
 import { httpError, isWithin } from "./directories.js";
+import { initializeOutbox, enqueueReport, readSyncConfig, validateBackfillRange } from "./sync-outbox.js";
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const BATCH_FILES = 32;
@@ -19,8 +20,9 @@ const fingerprint = (stat) =>
   `2:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 const db = new DatabaseSync(workerData.database);
 db.exec(
-  "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;",
+  "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE;",
 );
+initializeOutbox(db);
 let root = getSetting(db, "dataPath");
 let revision = Number(getSetting(db, "revision", "0"));
 let generation = Number(getSetting(db, "scanGeneration", "0"));
@@ -29,9 +31,12 @@ let rootVersion = 0;
 let rootWatcher;
 let pumping = false;
 let timer;
+let acquisitionRunning = false;
+let baselineRunning = false;
 const active = new Map();
 const snapshots = new Map();
 const privateHome = path.dirname(workerData.database);
+const scanErrors = new Map();
 let status = {
   root,
   revision,
@@ -92,6 +97,7 @@ transaction(db, () => {
     END;
   `);
 });
+db.exec("CREATE INDEX IF NOT EXISTS report_files_invalid ON report_files(root,valid,scope)");
 
 const fileRow = db.prepare(
   "SELECT fingerprint,valid,error FROM report_files WHERE path=? AND root=?",
@@ -112,6 +118,12 @@ const deleteFile = db.prepare(
   "DELETE FROM report_files WHERE path=? AND root=?",
 );
 
+function removeReport(file, reportRoot) {
+  const previous = db.prepare("SELECT id,json FROM reports WHERE path=? AND root=?").get(file, reportRoot);
+  if (previous) enqueueReport(db, previous.id, previous.json, true);
+  return deleteReport.run(file, reportRoot);
+}
+
 function publish() {
   status.root = root;
   status.revision = revision;
@@ -119,14 +131,18 @@ function publish() {
     db.prepare("SELECT count FROM report_counts WHERE root=?").get(root)
       ?.count ?? 0;
   status.activeDates = [...active.keys()];
+  const errors = new Map(scanErrors);
+  const invalid = db.prepare("SELECT path,error FROM report_files WHERE root=? AND valid=0 LIMIT 100").all(root);
+  for (const row of invalid) if (!errors.has(row.path)) errors.set(row.path, row.error);
+  status.errors = [...errors].slice(0, 100).map(([file, message]) => ({ path: file, message }));
   status.watching =
     Boolean(rootWatcher) || [...active.values()].some((scope) => scope.watcher);
   parentPort.postMessage({ type: "status", status });
 }
 
 function recordError(file, error) {
-  if (status.errors.length < 100)
-    status.errors.push({ path: file, message: error.message });
+  scanErrors.set(file, error.message);
+  while (scanErrors.size > 100) scanErrors.delete(scanErrors.keys().next().value);
 }
 
 function changed(count) {
@@ -247,7 +263,12 @@ async function attachRootWatcher() {
       if (scope) {
         scope.watcher?.close();
         scope.watcher = null;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(scope.date)) markDiscovered(scope.date);
         queue(scope);
+      }
+      else {
+        const date = String(name ?? "").split(path.sep)[0];
+        if (/^\d{4}-\d{2}-\d{2}$/.test(date)) markDiscovered(date);
       }
     });
     rootWatcher.on("error", (error) => {
@@ -279,7 +300,9 @@ function activate(query) {
     let scope = active.get(date);
     if (!scope) {
       while (active.size >= MAX_ACTIVE_DAYS) {
-        const [oldDate, old] = active.entries().next().value;
+        const today = localDay();
+        const yesterday = nextDay(today, -1);
+        const [oldDate, old] = [...active.entries()].find(([day]) => day !== today && day !== yesterday);
         old.watcher?.close();
         clearTimeout(old.retryTimer);
         old.resolve?.();
@@ -306,6 +329,9 @@ async function scanScope(scope, target) {
   const version = rootVersion;
   const scanRoot = root;
   const scanGeneration = ++generation;
+  for (const file of scanErrors.keys()) {
+    if (file === target || file.startsWith(`${target}${path.sep}`)) scanErrors.delete(file);
+  }
   setSetting(db, "scanGeneration", generation);
   let batch = [];
   let bytes = 0;
@@ -341,7 +367,7 @@ async function scanScope(scope, target) {
             .get(item.file);
           if (previous?.json !== item.json || previous?.root !== scanRoot) {
             if (previous && previous.root !== scanRoot)
-              deleteReport.run(item.file, previous.root);
+              removeReport(item.file, previous.root);
             writeReport.run(
               item.file,
               item.id,
@@ -353,10 +379,11 @@ async function scanScope(scope, target) {
               scanRoot,
               item.detailCount,
             );
+            enqueueReport(db, item.id, item.json, scope.historical ?? false);
             modifications += 1;
           }
         } else {
-          modifications += deleteReport.run(item.file, scanRoot).changes;
+          modifications += removeReport(item.file, scanRoot).changes;
         }
       }
       changed(modifications);
@@ -484,6 +511,13 @@ async function scanScope(scope, target) {
       ) {
         flush();
         await new Promise((resolve) => setImmediate(resolve));
+        // Yield history work to queued live dates at every bounded indexing batch.
+        if (scope.date < nextDay(localDay(), -1)) {
+          for (const date of [localDay(), nextDay(localDay(), -1)]) {
+            const live = active.get(date);
+            if (live && (live.full || live.paths.size)) await processQueuedScope(live);
+          }
+        }
       }
     } catch (error) {
       if (current(scope, version) && error.code !== "ENOENT") {
@@ -495,6 +529,7 @@ async function scanScope(scope, target) {
   }
   try {
     await authorized(scanRoot, true);
+    scanErrors.delete(scanRoot);
     await visit(target);
     flush();
     if (safeToPrune && !deferred && current(scope, version)) {
@@ -518,7 +553,7 @@ async function scanScope(scope, target) {
         transaction(db, () => {
           let modifications = 0;
           for (const row of stale) {
-            modifications += deleteReport.run(row.path, scanRoot).changes;
+            modifications += removeReport(row.path, scanRoot).changes;
             deleteFile.run(row.path, scanRoot);
           }
           changed(modifications);
@@ -527,6 +562,8 @@ async function scanScope(scope, target) {
         await new Promise((resolve) => setImmediate(resolve));
       }
     }
+    if (target === scope.directory || !safeToPrune || deferred)
+      scope.scanSucceeded = safeToPrune && !deferred && current(scope, version);
   } catch (error) {
     if (current(scope, version)) {
       scope.failed = error;
@@ -539,11 +576,33 @@ async function scanScope(scope, target) {
   }
 }
 
+async function processQueuedScope(scope) {
+  const targets = scope.full ? [scope.directory] : [...scope.paths];
+  scope.full = false;
+  scope.paths.clear();
+  scope.failed = null;
+  try {
+    await attachScopeWatcher(scope);
+    for (const target of targets) {
+      if (active.get(scope.date) !== scope || closed) break;
+      await scanScope(scope, target);
+    }
+  } catch (error) {
+    scope.failed = error;
+    scope.scanSucceeded = false;
+    recordError(scope.directory, error);
+  }
+  if (!scope.full && !scope.paths.size && !scope.retryTimer) {
+    scope.resolve?.();
+    scope.resolve = null;
+    scope.completion = null;
+  }
+}
+
 async function pump() {
   if (pumping || closed) return;
   pumping = true;
   status.scanning = true;
-  status.errors = [];
   status.scanProgress = {
     phase: "indexing",
     visited: 0,
@@ -561,21 +620,8 @@ async function pump() {
         (item) => item.full || item.paths.size,
       );
       if (!scope) break;
-      const targets = scope.full ? [scope.directory] : [...scope.paths];
-      scope.full = false;
-      scope.paths.clear();
-      scope.failed = null;
-      await attachScopeWatcher(scope);
-      for (const target of targets) {
-        if (active.get(scope.date) !== scope || closed) break;
-        await scanScope(scope, target);
-      }
+      await processQueuedScope(scope);
       if (active.get(scope.date) === scope) completedVersion = rootVersion;
-      if (!scope.full && !scope.paths.size && !scope.retryTimer) {
-        scope.resolve?.();
-        scope.resolve = null;
-        scope.completion = null;
-      }
     }
   } finally {
     pumping = false;
@@ -766,9 +812,138 @@ function deactivate() {
   active.clear();
 }
 
+function localDay() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+function nextDay(date, offset = 1) {
+  const value = new Date(`${date}T12:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + offset);
+  return value.toISOString().slice(0, 10);
+}
+
+function markDiscovered(date) {
+  if (!root || closed) return;
+  try { shiftBounds(date, "day"); } catch { return; }
+  try {
+    db.prepare(`INSERT INTO sync_scan_dates(root,date,pending) VALUES(?,?,1)
+      ON CONFLICT(root,date) DO UPDATE SET pending=1`).run(root, date);
+  } catch (error) {
+    recordError(root, error);
+    publish();
+  }
+}
+
+async function enqueueBaseline() {
+  if (baselineRunning || closed || !readSyncConfig(db)?.configured) return;
+  baselineRunning = true;
+  let after = "";
+  let configuration = getSetting(db, "syncConfig");
+  try {
+    while (!closed) {
+      const currentConfiguration = getSetting(db, "syncConfig");
+      if (currentConfiguration !== configuration) {
+        configuration = currentConfiguration;
+        after = "";
+      }
+      const row = db.prepare(`SELECT r.id,r.json FROM reports r
+        LEFT JOIN sync_versions v ON v.report_id=r.id
+        WHERE r.id>? AND (v.report_id IS NULL OR v.content_hash='') ORDER BY r.id LIMIT 1`).get(after);
+      if (!row) break;
+      transaction(db, () => enqueueReport(db, row.id, row.json, true));
+      after = row.id;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  } finally { baselineRunning = false; }
+}
+
+async function acquireReports() {
+  if (closed || acquisitionRunning || !root) return;
+  acquisitionRunning = true;
+  const scanRoot = root;
+  const version = rootVersion;
+  const valid = () => !closed && root === scanRoot && version === rootVersion;
+  const key = `acquisition:${createHash("sha256").update(scanRoot).digest("hex")}`;
+  try {
+    enqueueBaseline().catch((error) => { if (!closed) { recordError(scanRoot, error); publish(); } });
+    const today = localDay();
+    const yesterday = nextDay(today, -1);
+    const watermark = getSetting(db, key, yesterday);
+    // A crash during the first live scan must not move the recovery starting date.
+    if (!getSetting(db, key)) setSetting(db, key, watermark);
+    // Persist each completed day, never a whole-range optimistic watermark.
+    async function scanDay(date, historical = date < yesterday) {
+      if (!valid()) return false;
+      const [scope] = activate({ date, shift: "day" });
+      scope.historical = historical;
+      scope.scanSucceeded = false;
+      queue(scope);
+      await scope.completion;
+      if (!valid() || active.get(date) !== scope || !scope.scanSucceeded || scope.failed) return false;
+      db.prepare("UPDATE sync_scan_dates SET pending=0 WHERE root=? AND date=?").run(scanRoot, date);
+      scope.historical = date < yesterday;
+      return true;
+    }
+    // Streaming discovery records directory identities on disk, not a RAM history list.
+    // On first use, old untouched directories are opt-in history, not an automatic years-long import.
+    const discovered = getSetting(db, `${key}:discovered`) === "true";
+    await authorized(scanRoot, true);
+    const entries = await fs.opendir(scanRoot, { bufferSize: 32 });
+    for await (const entry of entries) {
+      if (!valid()) return;
+      if (!entry.isDirectory() || !/^\d{4}-\d{2}-\d{2}$/.test(entry.name)) continue;
+      try { shiftBounds(entry.name, "day"); } catch { continue; }
+      db.prepare("INSERT OR IGNORE INTO sync_scan_dates(root,date,pending) VALUES(?,?,?)")
+        .run(scanRoot, entry.name, Number(discovered));
+    }
+    if (!valid()) return;
+    setSetting(db, `${key}:discovered`, "true");
+    // Watch live dates before traversing a potentially months-long stopped-service gap.
+    if (!await scanDay(today) || !await scanDay(yesterday)) return;
+    for (let date = watermark < yesterday ? watermark : yesterday; date <= today; date = nextDay(date)) {
+      if (!await scanDay(date)) return;
+      setSetting(db, key, date);
+    }
+    while (valid()) {
+      const row = db.prepare("SELECT date FROM sync_scan_dates WHERE root=? AND pending=1 AND date<=? ORDER BY date LIMIT 1")
+        .get(scanRoot, today);
+      if (!row) break;
+      if (!await scanDay(row.date)) return;
+    }
+    while (valid()) {
+      const row = db.prepare("SELECT date FROM sync_backfill WHERE root=? ORDER BY date LIMIT 1").get(scanRoot);
+      if (!row) break;
+      if (!await scanDay(row.date, true)) return;
+      db.prepare("DELETE FROM sync_backfill WHERE root=? AND date=?").run(scanRoot, row.date);
+      publish();
+    }
+  } catch (error) {
+    if (valid()) { recordError(scanRoot, error); publish(); }
+  } finally {
+    acquisitionRunning = false;
+    if (!closed && !valid()) setImmediate(() => acquireReports().catch(fatal));
+  }
+}
+
 async function dispatch(method, params) {
   if (closed && method !== "close") throw httpError(503, "报告索引已关闭");
   if (method === "query") return queryReports(params);
+  if (method === "syncConfigure") {
+    enqueueBaseline().catch((error) => { recordError(root, error); publish(); });
+    return;
+  }
+  if (method === "syncBackfill") {
+    if (!root) throw httpError(400, "请先选择本地报告目录");
+    const { from, to } = validateBackfillRange(params);
+    let scheduled = 0;
+    transaction(db, () => {
+      const insert = db.prepare("INSERT OR IGNORE INTO sync_backfill(root,date) VALUES(?,?)");
+      for (let date = from; date <= to; date = nextDay(date)) scheduled += insert.run(root, date).changes;
+    });
+    acquireReports().catch(fatal);
+    return { from, to, scheduled };
+  }
   if (method === "exportOpen") return exportOpen(params);
   if (method === "exportNext") return exportNext(params.token, params.start);
   if (method === "exportClose") return exportClose(params.token);
@@ -784,6 +959,7 @@ async function dispatch(method, params) {
     });
     status.lastScan = null;
     status.errors = [];
+    scanErrors.clear();
     status.scanProgress = {
       phase: "idle",
       visited: 0,
@@ -794,6 +970,7 @@ async function dispatch(method, params) {
       startedAt: null,
     };
     await attachRootWatcher();
+    acquireReports().catch(fatal);
     publish();
     return root;
   }
@@ -808,6 +985,7 @@ async function dispatch(method, params) {
     deactivate();
     clearInterval(reconcile);
     clearInterval(expiry);
+    clearInterval(acquisition);
     for (const token of snapshots.keys()) exportClose(token);
     return;
   }
@@ -830,6 +1008,8 @@ const expiry = setInterval(() => {
     if (Date.now() - snapshot.touched > 120000) exportClose(token);
 }, 30000);
 expiry.unref();
+const acquisition = setInterval(() => { acquireReports().catch(fatal); }, 60000);
+acquisition.unref();
 parentPort.on("message", ({ id, method, params }) => {
   Promise.resolve()
     .then(() => dispatch(method, params))
@@ -845,3 +1025,4 @@ parentPort.on("message", ({ id, method, params }) => {
 await attachRootWatcher();
 publish();
 parentPort.postMessage({ type: "ready" });
+acquireReports().catch(fatal);

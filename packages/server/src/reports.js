@@ -139,6 +139,14 @@ export class ReportStore extends EventEmitter {
     return this.request("query", params);
   }
 
+  syncConfigure() {
+    return this.request("syncConfigure");
+  }
+
+  syncBackfill(range) {
+    return this.request("syncBackfill", range);
+  }
+
   async exportSnapshot(query, selection = {}) {
     const snapshot = await this.request("exportOpen", { query, selection });
     let closed = false;

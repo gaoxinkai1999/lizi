@@ -66,6 +66,7 @@ function publicPeer(peer) {
         address: peer.address,
         port: peer.port,
         fingerprint: peer.fingerprint,
+        canQuery: Boolean(peer.token),
       }
     : null;
 }
@@ -117,7 +118,6 @@ class LanManager extends EventEmitter {
     this.state = null;
     this.identity = null;
     this.closed = false;
-    this.connected = false;
     this.lastError = null;
     this.server = null;
     this.starting = null;
@@ -136,7 +136,7 @@ class LanManager extends EventEmitter {
     this.operations = new Set();
     this.handlers = new Set();
     this.generation = 0;
-    this.reconnectDelay = 1000;
+    this.connections = new Map();
     this.onRevision = (value) => this.broadcast(value);
     this.store.on("revision", this.onRevision);
     this.mutations = Promise.resolve();
@@ -152,8 +152,14 @@ class LanManager extends EventEmitter {
       )
         throw new Error("局域网配置损坏，请恢复lan-settings.json");
       deviceName(saved.name);
-      if (saved.peer) this.validatePeer(saved.peer);
-      if (saved.joining && saved.mode === "host" && !saved.peer) {
+      const peers = saved.peers ?? (saved.peer ? [saved.peer] : []);
+      if (!Array.isArray(peers) || peers.length > 8 || new Set(peers.map((peer) => peer.id)).size !== peers.length)
+        throw new Error("局域网设备列表损坏");
+      for (const peer of peers) this.validatePeer(peer);
+      saved.peers = peers;
+      const migrated = Object.hasOwn(saved, "peer") || Object.hasOwn(saved, "pairing");
+      delete saved.peer;
+      if (saved.joining && saved.mode !== "standalone") {
         const joining = saved.joining;
         this.validatePeer(joining);
         if (
@@ -165,25 +171,26 @@ class LanManager extends EventEmitter {
           throw new Error("局域网配对状态损坏，请恢复lan-settings.json");
         this.joining = { ...joining };
       }
-      if (saved.pairing !== null && saved.pairing !== undefined) {
-        if (
-          !saved.pairing ||
-          typeof saved.pairing.id !== "string" ||
-          typeof saved.pairing.ticket !== "string" ||
-          !Number.isFinite(saved.pairing.expiresAt) ||
-          typeof saved.pairing.approved !== "string"
-        )
+      const pairings = saved.pairings ?? (saved.pairing ? [saved.pairing] : []);
+      if (!Array.isArray(pairings) || pairings.length > 8)
+        throw new Error("局域网配对状态损坏，请恢复lan-settings.json");
+      for (const pairing of pairings) {
+        if (!pairing || typeof pairing.id !== "string" ||
+            typeof pairing.ticket !== "string" || !Number.isFinite(pairing.expiresAt) ||
+            typeof pairing.approved !== "string")
           throw new Error("局域网配对状态损坏，请恢复lan-settings.json");
-        this.pending = { ...saved.pairing, key: null };
       }
+      saved.pairings = pairings;
+      delete saved.pairing;
       this.state = saved;
+      if (migrated) await atomicJson(this.file, saved);
     } else {
       this.state = {
         mode: "standalone",
         deviceId: crypto.randomUUID(),
         name: deviceName(os.hostname().slice(0, 80) || "Lizi"),
-        peer: null,
-        pairing: null,
+        peers: [],
+        pairings: [],
         epoch: 0,
       };
       await atomicJson(this.file, this.state);
@@ -217,7 +224,7 @@ class LanManager extends EventEmitter {
       deviceId: this.state.deviceId,
       name: this.state.name,
       port: this.options.port,
-      peer: publicPeer(this.state.peer),
+      peers: this.state.peers.map(publicPeer),
       epoch: this.state.epoch,
     };
   }
@@ -232,7 +239,14 @@ class LanManager extends EventEmitter {
     return {
       ...this.getSettings(),
       listening: Boolean(this.server?.listening),
-      connected: this.connected,
+      peers: this.state.peers.map((peer) => ({
+        ...publicPeer(peer),
+        connected: peer.token
+          ? Boolean(this.connections.get(peer.id)?.connected)
+          : [...this.streams].some((stream) => stream.peerId === peer.id),
+        lastError: this.connections.get(peer.id)?.lastError ?? null,
+      })),
+      connected: [...this.connections.values()].some((connection) => connection.connected) || this.streams.size > 0,
       lastError: this.lastError,
       addresses: addresses(this.options.allowLoopback),
       discovered: [...this.discovered.values()]
@@ -320,10 +334,8 @@ class LanManager extends EventEmitter {
 
   async startNetwork() {
     await this.ensureIdentity();
-    if (this.state.mode === "host" && this.options.port === 0)
-      this.options.port = 3211;
     if (this.closed || this.state.mode === "standalone") return;
-    if (this.state.mode === "collector" && !this.server) {
+    if (!this.server) {
       const server = https.createServer(
         {
           key: this.identity.key,
@@ -380,14 +392,9 @@ class LanManager extends EventEmitter {
       this.sweepTimer = setInterval(() => this.sweep(), 1000);
       this.sweepTimer.unref();
     }
-    if (this.state.mode === "host" && this.state.peer && !this.eventJob)
-      this.scheduleReconnect(0);
-    if (
-      this.state.mode === "host" &&
-      !this.state.peer &&
-      this.joining?.status === "pending"
-    )
-      this.scheduleJoinPoll();
+    for (const peer of this.state.peers)
+      if (peer.token) this.scheduleReconnect(peer.id, 0);
+    if (this.joining?.status === "pending") this.scheduleJoinPoll();
     this.emit("status");
   }
 
@@ -396,7 +403,7 @@ class LanManager extends EventEmitter {
       if (!["standalone", "host", "collector"].includes(mode))
         throw httpError(400, "局域网模式无效");
       const nextName = name === undefined ? this.state.name : deviceName(name);
-      if (mode !== this.state.mode && this.state.peer)
+      if (mode !== this.state.mode && this.state.peers.length && mode === "standalone")
         throw httpError(409, "请先断开已配对设备，再切换模式");
       if (mode === this.state.mode && nextName === this.state.name) {
         await this.start();
@@ -414,7 +421,6 @@ class LanManager extends EventEmitter {
         ...this.state,
         mode,
         name: nextName,
-        pairing: changedMode ? null : this.state.pairing,
         joining: changedMode ? null : this.state.joining,
         epoch: this.state.epoch + 1,
       });
@@ -432,7 +438,7 @@ class LanManager extends EventEmitter {
     if (
       !this.options.discovery ||
       this.discoverySocket ||
-      this.state.mode !== "collector"
+      this.state.mode === "standalone"
     )
       return;
     const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
@@ -504,7 +510,7 @@ class LanManager extends EventEmitter {
     this.discovered.set(peer.id, { ...peer, seen: Date.now() });
     while (this.discovered.size > 32)
       this.discovered.delete(this.discovered.keys().next().value);
-    const paired = this.state.peer;
+    const paired = this.state.peers.find((entry) => entry.id === peer.id);
     if (
       paired &&
       paired.id === peer.id &&
@@ -516,19 +522,15 @@ class LanManager extends EventEmitter {
       if (info.id !== paired.id) throw httpError(409, "设备身份已变化");
       await this.mutate(async () => {
         if (
-          this.state.peer?.id !== peer.id ||
-          this.state.peer.fingerprint !== peer.fingerprint
+          !this.state.peers.some((entry) => entry.id === peer.id && entry.fingerprint === peer.fingerprint)
         )
           return;
         await this.save(
           {
             ...this.state,
-            peer: {
-              ...this.state.peer,
-              address: peer.address,
-              port: peer.port,
-              name: peer.name,
-            },
+            peers: this.state.peers.map((entry) => entry.id === peer.id
+              ? { ...entry, address: peer.address, port: peer.port, name: peer.name }
+              : entry),
           },
           false,
         );
@@ -537,8 +539,8 @@ class LanManager extends EventEmitter {
   }
 
   async discover({ address, port } = {}) {
-    if (this.closed || this.state.mode !== "host")
-      throw httpError(409, "只有主机可以发现采集端");
+    if (this.closed || this.state.mode === "standalone")
+      throw httpError(409, "请先启用局域网连接");
     if (address !== undefined) {
       if (!privateAddress(address, this.options.allowLoopback))
         throw httpError(400, "手动探测只允许私网IPv4地址");
@@ -547,7 +549,7 @@ class LanManager extends EventEmitter {
         "/lan/info",
         { probe: true },
       );
-      if (info.mode !== "collector") throw httpError(409, "目标不是采集端");
+      if (info.mode === "standalone") throw httpError(409, "目标未启用局域网连接");
       await this.recordDiscovered({ ...info, address, port: portNumber(port) });
       this.emit("status");
       return this.getStatus();
@@ -628,10 +630,10 @@ class LanManager extends EventEmitter {
 
   openPairing() {
     return this.mutate(async () => {
-      if (this.state.mode !== "collector")
-        throw httpError(409, "请先切换为采集端B");
-      if (this.state.peer)
-        throw httpError(409, "采集端已经配对，请先断开旧设备");
+      if (this.state.mode === "standalone")
+        throw httpError(409, "请先启用局域网连接");
+      if (this.state.peers.length >= 8)
+        throw httpError(409, "最多配对8个设备");
       await this.start();
       this.openUntil = Date.now() + LIMITS.pairingMs;
       this.pending = null;
@@ -642,8 +644,8 @@ class LanManager extends EventEmitter {
 
   join({ address, port, fingerprint } = {}) {
     return this.mutate(async () => {
-      if (this.state.mode !== "host" || this.state.peer)
-        throw httpError(409, "主机须未配对才能连接采集端");
+      if (this.state.mode === "standalone" || this.state.peers.length >= 8)
+        throw httpError(409, "请启用局域网连接，最多配对8个设备");
       if (this.joining?.status === "pending")
         throw httpError(409, "已有配对请求，请等待完成或断开");
       if (!privateAddress(address, this.options.allowLoopback))
@@ -681,6 +683,8 @@ class LanManager extends EventEmitter {
         port: peer.port,
         fingerprint: peer.fingerprint,
       });
+      if (collector.id === this.state.deviceId || this.state.peers.some((entry) => entry.id === collector.id))
+        throw httpError(409, "设备已配对或不能连接自己");
       const joining = {
         ...collector,
         ticket: result.ticket,
@@ -707,7 +711,7 @@ class LanManager extends EventEmitter {
 
   finishJoin(joining, status) {
     return this.mutate(async () => {
-      if (this.joining !== joining || this.state.peer) return;
+      if (this.joining !== joining) return;
       await this.save({ ...this.state, joining: null }, false);
       joining.status = status;
       delete joining.ticket;
@@ -745,17 +749,18 @@ class LanManager extends EventEmitter {
       if (!/^[A-Za-z0-9_-]{43}$/.test(token))
         throw httpError(502, "配对授权格式无效");
       await this.mutate(async () => {
-        if (this.joining !== joining || this.state.peer) return;
+        if (this.joining !== joining || this.state.peers.some((peer) => peer.id === joining.id)) return;
+        if (this.state.peers.length >= 8) throw httpError(409, "最多配对8个设备");
         await this.save({
           ...this.state,
-          peer: { ...publicPeer(joining), token },
+          peers: [...this.state.peers, { ...this.validatePeer(joining), token }],
           joining: null,
           epoch: this.state.epoch + 1,
         });
         joining.status = "approved";
         delete joining.ticket;
         this.emit("status");
-        this.scheduleReconnect(0);
+        this.scheduleReconnect(joining.id, 0);
       });
     } catch (error) {
       if (this.joining !== joining || this.closed) return;
@@ -768,8 +773,8 @@ class LanManager extends EventEmitter {
 
   async receiveJoin(req) {
     if (
-      this.state.mode !== "collector" ||
-      this.state.peer ||
+      this.state.mode === "standalone" ||
+      this.state.peers.length >= 8 ||
       this.openUntil <= Date.now()
     )
       throw httpError(403, "采集端未打开配对窗口");
@@ -781,6 +786,8 @@ class LanManager extends EventEmitter {
     const input = await readBody(req);
     const address = req.socket.remoteAddress.replace(/^::ffff:/, "");
     const peer = this.validatePeer({ ...input, address });
+    if (peer.id === this.state.deviceId || this.state.peers.some((entry) => entry.id === peer.id))
+      throw httpError(409, "设备已配对或不能连接自己");
     if (
       typeof input.publicKey !== "string" ||
       input.publicKey.length > 1500 ||
@@ -824,9 +831,9 @@ class LanManager extends EventEmitter {
     return this.mutate(async () => {
       const pending = this.pending;
       if (
-        this.state.mode !== "collector" ||
-        this.state.peer ||
-        !pending ||
+        this.state.mode === "standalone" ||
+        this.state.peers.length >= 8 ||
+        !pending || pending.approved ||
         pending.expiresAt <= Date.now()
       )
         throw httpError(409, "没有有效待确认请求");
@@ -845,13 +852,11 @@ class LanManager extends EventEmitter {
         .toString("base64");
       await this.save({
         ...this.state,
-        peer: { ...publicPeer(pending), tokenHash: tokenHash(token) },
-        pairing: {
-          id: pending.id,
-          ticket: pending.ticket,
-          expiresAt: pending.expiresAt,
-          approved: encryptedToken,
-        },
+        peers: [...this.state.peers, { ...this.validatePeer(pending), tokenHash: tokenHash(token) }],
+        pairings: [
+          ...this.state.pairings.filter((pairing) => pairing.expiresAt > Date.now()),
+          { id: pending.id, ticket: pending.ticket, expiresAt: pending.expiresAt, approved: encryptedToken },
+        ],
         epoch: this.state.epoch + 1,
       });
       pending.approved = encryptedToken;
@@ -864,7 +869,8 @@ class LanManager extends EventEmitter {
 
   async receivePoll(req) {
     const input = await readBody(req);
-    const pending = this.pending;
+    const pending = this.state.pairings.find((pairing) => equalSecret(input.ticket, pairing.ticket))
+      ?? this.pending;
     if (
       !pending ||
       pending.expiresAt <= Date.now() ||
@@ -876,51 +882,52 @@ class LanManager extends EventEmitter {
       : { approved: false };
   }
 
-  disconnect() {
+  disconnect({ id } = {}) {
     return this.mutate(async () => {
-      const peer = this.state.peer;
-      this.generation++;
-      clearTimeout(this.joinTimer);
-      this.joining = null;
-      this.pending = null;
-      this.openUntil = 0;
-      this.abortOutgoing();
-      if (this.state.mode === "host" && peer?.token) {
-        try {
-          await this.request(peer, "/lan/revoke", {
-            method: "POST",
-            body: {},
-            token: peer.token,
-            timeout: 3000,
-          });
-        } catch {
-          this.lastError =
-            "本机已忘记对端；采集端离线时请在采集端也点断开以撤销其授权";
-        }
+      if (id !== undefined && !this.state.peers.some((peer) => peer.id === id))
+        throw httpError(404, "设备未配对");
+      const removed = this.state.peers.filter((peer) => id === undefined || peer.id === id);
+      if (id === undefined) {
+        clearTimeout(this.joinTimer);
+        this.joining = null;
+        this.pending = null;
+        this.openUntil = 0;
       }
+      if (id !== undefined && this.pending?.id === id) this.pending = null;
       await this.save({
         ...this.state,
-        peer: null,
-        pairing: null,
-        joining: null,
+        peers: this.state.peers.filter((peer) => !removed.includes(peer)),
+        pairings: this.state.pairings.filter((pairing) => id !== undefined && pairing.id !== id),
+        joining: id === undefined ? null : this.state.joining,
         epoch: this.state.epoch + 1,
       });
-      await this.releaseCollector();
-      this.setConnected(false);
+      for (const peer of removed) {
+        this.abortPeer(peer.id);
+        await this.releaseCollector(peer.id);
+        if (peer.token) {
+          try {
+            await this.request(peer, "/lan/revoke", {
+              method: "POST", body: {}, token: peer.token, timeout: 3000,
+            });
+          } catch {
+            this.lastError = "本机已移除设备；离线设备恢复后请同时撤销对端授权";
+          }
+        }
+      }
       return this.getSettings();
     });
   }
 
   authenticate(req) {
     const bearer = req.headers.authorization;
-    if (
-      this.state.mode !== "collector" ||
-      !this.state.peer?.tokenHash ||
-      typeof bearer !== "string" ||
-      !/^Bearer [A-Za-z0-9_-]{43}$/.test(bearer) ||
-      !equalSecret(tokenHash(bearer.slice(7)), this.state.peer.tokenHash)
-    )
+    if (typeof bearer !== "string" || !/^Bearer [A-Za-z0-9_-]{43}$/.test(bearer))
       throw httpError(401, "设备未配对或授权已撤销");
+    const hash = tokenHash(bearer.slice(7));
+    const peer = this.state.peers.find((peer) => peer.tokenHash && equalSecret(hash, peer.tokenHash));
+    if (!peer || this.state.mode === "standalone")
+      throw httpError(401, "设备未配对或授权已撤销");
+    req.peerId = peer.id;
+    return peer;
   }
 
   async request(peer, route, options = {}) {
@@ -928,6 +935,7 @@ class LanManager extends EventEmitter {
       throw httpError(400, "只允许私网IPv4地址");
     const controller = new AbortController();
     this.operations.add(controller);
+    controller.peerId = peer.id;
     const signal = options.signal
       ? AbortSignal.any([controller.signal, options.signal])
       : controller.signal;
@@ -938,14 +946,15 @@ class LanManager extends EventEmitter {
     }
   }
 
-  async fetchReports(query, { signal } = {}) {
+  async fetchReports(query, { peerId, signal } = {}) {
     query = parseQuery(query);
-    const peer = this.state.peer;
-    if (this.closed || this.state.mode !== "host" || !peer?.token)
-      throw httpError(401, "主机尚未配对采集端");
+    const peer = this.state.peers.find((peer) => peer.id === peerId);
+    if (this.closed || this.state.mode === "standalone" || !peer?.token)
+      throw httpError(401, "尚未配对此报告来源");
     if (this.fetches.size >= 2)
       throw httpError(429, "采集端报告请求繁忙，请稍后重试");
     const controller = new AbortController();
+    controller.peerId = peer.id;
     this.fetches.add(controller);
     const deadline = setTimeout(() => controller.abort(), LIMITS.snapshotMs);
     const combined = signal
@@ -996,7 +1005,7 @@ class LanManager extends EventEmitter {
       if (
         combined.aborted ||
         generation !== this.generation ||
-        this.state.peer !== peer
+        !this.state.peers.some((entry) => entry.id === peer.id && entry.token === peer.token)
       )
         throw httpError(499, "报告请求已取消或设备配置已变化");
       if (reports.length !== snapshot.count)
@@ -1030,7 +1039,7 @@ class LanManager extends EventEmitter {
     const route = new URL(req.url, "https://lan.invalid").pathname;
     if (req.method === "GET" && route === "/lan/info") {
       sendJson(res, {
-        mode: "collector",
+        mode: this.state.mode,
         id: this.state.deviceId,
         name: this.state.name,
         port: this.options.port,
@@ -1046,17 +1055,17 @@ class LanManager extends EventEmitter {
       sendJson(res, await this.receivePoll(req));
       return;
     }
-    this.authenticate(req);
+    const peer = this.authenticate(req);
     if (req.method === "POST" && route === "/lan/revoke") {
       await this.mutate(async () => {
         await this.save({
           ...this.state,
-          peer: null,
-          pairing: null,
+          peers: this.state.peers.filter((entry) => entry.id !== peer.id),
+          pairings: this.state.pairings.filter((pairing) => pairing.id !== peer.id),
           epoch: this.state.epoch + 1,
         });
-        this.pending = null;
-        await this.releaseCollector();
+        if (this.pending?.id === peer.id) this.pending = null;
+        await this.releaseCollector(peer.id);
       });
       sendJson(res, { revoked: true });
       return;
@@ -1070,6 +1079,8 @@ class LanManager extends EventEmitter {
       return;
     }
     const match = /^\/lan\/snapshots\/([a-f0-9]{48})$/.exec(route);
+    if (match && this.snapshots.get(match[1])?.peerId !== req.peerId)
+      throw httpError(410, "报告快照已过期");
     if (match && req.method === "DELETE") {
       await this.closeSnapshot(match[1]);
       sendJson(res, { closed: true });
@@ -1088,18 +1099,19 @@ class LanManager extends EventEmitter {
       throw httpError(429, "最多同时读取两个日期快照");
     if (!this.store.root) throw httpError(409, "采集端尚未选择数据目录");
     this.openingSnapshots++;
-    const peer = this.state.peer;
+    const peer = this.state.peers.find((peer) => peer.id === req.peerId);
     let snapshot;
     try {
       snapshot = await this.store.exportSnapshot(query, { allSelected: true });
       const status = this.store.status();
-      if (this.closed || peer !== this.state.peer || res.destroyed)
+      if (this.closed || !this.state.peers.includes(peer) || res.destroyed)
         throw httpError(409, "配对或请求已变化");
       if (snapshot.count > LIMITS.rows)
         throw httpError(413, "单个日期快照超过20000行");
       if (status.errors?.length) throw httpError(503, "采集端报告索引不完整");
       const id = crypto.randomBytes(24).toString("hex");
       const session = {
+        peerId: req.peerId,
         snapshot,
         iterator: snapshot.reports[Symbol.asyncIterator](),
         touched: Date.now(),
@@ -1181,16 +1193,18 @@ class LanManager extends EventEmitter {
   }
 
   serveEvents(req, res) {
-    if (this.streams.size >= 2) throw httpError(429, "事件连接过多");
+    if (this.streams.size >= 16 || [...this.streams].filter((stream) => stream.peerId === req.peerId).length >= 2)
+      throw httpError(429, "事件连接过多");
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-store",
       connection: "keep-alive",
     });
     res.flushHeaders();
+    res.peerId = req.peerId;
     this.streams.add(res);
-    this.pending = null;
-    this.setConnected(true);
+    if (this.pending?.id === req.peerId) this.pending = null;
+    this.emit("status");
     res.write(
       `event: change\ndata: ${JSON.stringify({ revision: this.store.revision })}\n\n`,
     );
@@ -1201,7 +1215,7 @@ class LanManager extends EventEmitter {
     res.once("close", () => {
       clearInterval(heartbeat);
       this.streams.delete(res);
-      this.setConnected(this.streams.size > 0);
+      this.emit("status");
     });
   }
 
@@ -1212,56 +1226,43 @@ class LanManager extends EventEmitter {
       if (!stream.write(message)) stream.destroy();
   }
 
-  setConnected(value) {
-    if (this.connected === value) return;
-    this.connected = value;
-    if (value) this.lastError = null;
-    this.emit("status");
-  }
 
-  scheduleReconnect(delay = this.reconnectDelay) {
-    clearTimeout(this.reconnectTimer);
-    if (
-      this.closed ||
-      this.state.mode !== "host" ||
-      !this.state.peer ||
-      this.eventJob
-    )
-      return;
-    this.reconnectTimer = setTimeout(() => {
-      this.eventJob = this.connectEvents().finally(() => {
-        this.eventJob = null;
-        this.scheduleReconnect();
+  scheduleReconnect(id, delay) {
+    const peer = this.state.peers.find((peer) => peer.id === id);
+    if (this.closed || this.state.mode === "standalone" || !peer?.token) return;
+    let connection = this.connections.get(id);
+    if (!connection) {
+      connection = { connected: false, lastError: null, delay: 1000 };
+      this.connections.set(id, connection);
+    }
+    if (connection.job || connection.timer) return;
+    connection.timer = setTimeout(() => {
+      connection.timer = null;
+      connection.job = this.connectEvents(peer, connection).finally(() => {
+        connection.job = null;
+        if (this.connections.get(id) === connection) this.scheduleReconnect(id);
       });
-    }, delay);
-    this.reconnectTimer.unref();
+    }, delay ?? connection.delay);
+    connection.timer.unref();
   }
 
   forgetRevokedPeer(peer) {
     return this.mutate(async () => {
-      if (this.state.peer !== peer) return;
-      this.generation++;
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-      this.joining = null;
-      this.abortOutgoing();
+      if (!this.state.peers.some((entry) => entry.id === peer.id && entry.token === peer.token)) return;
+      this.abortPeer(peer.id);
       await this.save({
         ...this.state,
-        peer: null,
-        pairing: null,
-        joining: null,
+        peers: this.state.peers.filter((entry) => entry.id !== peer.id),
         epoch: this.state.epoch + 1,
       });
-      await this.releaseCollector();
-      this.fail("采集端已撤销本机授权，请重新配对");
+      this.fail(new Error(`${peer.name}已撤销本机授权，请重新配对`));
     });
   }
 
-  async connectEvents() {
-    const peer = this.state.peer;
+  async connectEvents(peer, connection) {
     const generation = this.generation;
     const controller = new AbortController();
-    this.eventController = controller;
+    connection.controller = controller;
     let opened;
     let idle;
     try {
@@ -1273,8 +1274,10 @@ class LanManager extends EventEmitter {
         throw httpError(opened.response.statusCode, "采集端事件连接被拒绝");
       if (generation !== this.generation || this.closed) return;
       opened.clearDeadline();
-      this.setConnected(true);
-      this.reconnectDelay = 1000;
+      connection.connected = true;
+      connection.lastError = null;
+      connection.delay = 1000;
+      this.emit("status");
       let buffer = "";
       let revision;
       const touch = () => {
@@ -1282,7 +1285,7 @@ class LanManager extends EventEmitter {
         idle = setTimeout(() => controller.abort(), 40_000);
       };
       touch();
-      this.emit("change", { reconnected: true });
+      this.emit("change", { peerId: peer.id, reconnected: true });
       opened.response.setEncoding("utf8");
       for await (const chunk of opened.response) {
         touch();
@@ -1302,27 +1305,32 @@ class LanManager extends EventEmitter {
           if (data.revision !== revision) {
             const initial = revision === undefined;
             revision = data.revision;
-            if (!initial) this.emit("change", { revision });
+            if (!initial) this.emit("change", { peerId: peer.id, revision });
           }
         }
       }
     } catch (error) {
       if (
+        !this.closed && !controller.signal.aborted &&
         (error.status === 401 || error.status === 403) &&
-        peer === this.state.peer
+        this.state.peers.some((entry) => entry.id === peer.id && entry.token === peer.token)
       )
-        await this.forgetRevokedPeer(peer).catch((cause) => this.fail(cause));
-      else if (!this.closed && generation === this.generation) this.fail(error);
+        void this.forgetRevokedPeer(peer).catch((cause) => this.fail(cause));
+      else if (!this.closed && !controller.signal.aborted) {
+        connection.lastError = String(error.message || "局域网连接失败").slice(0, 200);
+        this.emit("status");
+      }
     } finally {
       clearTimeout(idle);
       opened?.dispose();
-      if (this.eventController === controller) this.eventController = null;
-      this.setConnected(false);
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30_000);
+      connection.controller = null;
+      connection.connected = false;
+      connection.delay = Math.min(connection.delay * 2, 30_000);
+      this.emit("status");
       if (
         !this.closed &&
         generation === this.generation &&
-        this.state.peer &&
+        this.state.peers.some((entry) => entry.id === peer.id) &&
         this.options.discovery
       )
         this.discover().catch((error) => this.fail(error));
@@ -1350,23 +1358,38 @@ class LanManager extends EventEmitter {
       if (now - peer.seen > 60_000) this.discovered.delete(id);
   }
 
+  abortPeer(id) {
+    const connection = this.connections.get(id);
+    if (connection) {
+      clearTimeout(connection.timer);
+      connection.controller?.abort();
+      this.connections.delete(id);
+    }
+    for (const controller of this.operations)
+      if (controller.peerId === id) controller.abort();
+    for (const controller of this.fetches)
+      if (controller.peerId === id) controller.abort();
+  }
+
   abortOutgoing() {
-    clearTimeout(this.reconnectTimer);
+    for (const id of this.connections.keys()) this.abortPeer(id);
     clearTimeout(this.joinTimer);
-    this.eventController?.abort();
     for (const controller of this.operations) controller.abort();
     for (const controller of this.fetches) controller.abort();
   }
 
-  async releaseCollector() {
-    for (const stream of this.streams) stream.destroy();
+  async releaseCollector(peerId) {
+    for (const stream of this.streams)
+      if (peerId === undefined || stream.peerId === peerId) stream.destroy();
     await Promise.all(
-      [...this.snapshots.keys()].map((id) => this.closeSnapshot(id)),
+      [...this.snapshots].filter(([, session]) => peerId === undefined || session.peerId === peerId)
+        .map(([id]) => this.closeSnapshot(id)),
     );
-    this.setConnected(false);
+    this.emit("status");
   }
 
   async stopNetwork() {
+    const jobs = [...this.connections.values()].map((connection) => connection.job);
     this.abortOutgoing();
     clearInterval(this.sweepTimer);
     this.sweepTimer = null;
@@ -1387,7 +1410,7 @@ class LanManager extends EventEmitter {
     }
     this.discoverySocket = null;
     this.probeSocket = null;
-    await this.eventJob;
+    await Promise.allSettled(jobs);
   }
 
   async close() {

@@ -1,9 +1,11 @@
 {
+  "recordType": "legacy-deployment-not-migrated",
+  "note": "3.0 代码发布不代表线上切换；此记录仅保留旧入口，sq.abocidee.com 旧站与这里的 lizi 域名不是同一个服务。",
   "applicationUrl": "https://lizi.abocidee.com",
   "access": {
     "authenticationEnabled": false,
     "optionalAuthentication": true,
-    "publicCapabilities": "报告查询、导出、数据目录及远程设置；公开模式隐藏并禁用账户接口"
+    "publicCapabilities": "2.2.x 公开模式可查询和导出；报告目录、局域网和远程配置仅限本机桌面管理"
   },
   "windows": {
     "installDirectory": "C:\\Lizi",

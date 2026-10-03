@@ -1,6 +1,6 @@
 {
   "name": "@lizi/web",
-  "version": "2.2.1",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "vue": "^3.5.18",
-    "qrcode": "^1.5.4",
     "lucide-vue-next": "^0.468.0"
   },
   "devDependencies": {

@@ -22,13 +22,14 @@ const compared = ref("");
 const name = ref("");
 const mode = ref("standalone");
 const disconnectOpen = ref(false);
+const disconnectTarget = ref(null);
 const adapters = ref([]);
 const selectedAdapter = ref("");
 const adapterError = ref("");
 const nativeBusy = ref(false);
 const now = ref(Date.now());
 const canManage = computed(() => Boolean(lan.value?.canManage));
-const modes = { standalone: "单机", host: "主机 A", collector: "采集端 B" };
+const modes = { standalone: "仅本机", host: "局域网汇总", collector: "局域网采集" };
 const pairing = computed(() => lan.value?.pairing);
 const pending = computed(() =>
   (pairing.value?.pending || []).filter(
@@ -159,7 +160,7 @@ async function approve(item) {
     compared.value = "";
 }
 async function disconnect() {
-  if (await mutate("disconnect", "/lan/peer", "DELETE"))
+  if (await mutate("disconnect", "/lan/peer", "DELETE", disconnectTarget.value ? { id: disconnectTarget.value.id } : {}))
     disconnectOpen.value = false;
 }
 async function loadAdapters() {
@@ -238,11 +239,8 @@ onUnmounted(() => {
     <div class="section-heading">
       <Network :size="21" />
       <div>
-        <h2 id="lan-settings-title">局域网双机</h2>
-        <p>
-          主机 A 汇总本机与采集端 B
-          报告；默认单机，不会自动修改网卡或远程访问配置。
-        </p>
+        <h2 id="lan-settings-title">局域网来源管理</h2>
+        <p>本机始终独立采集。最多配对8个设备，只读取各设备的本机报告，不转发其他来源；断网不影响本机保存和查看。</p>
       </div>
       <button
         class="icon-button"
@@ -272,7 +270,7 @@ onUnmounted(() => {
           <dt>连接</dt>
           <dd>
             <span class="status-dot" :class="{ good: lan.connected }" />{{
-              lan.connected ? "在线" : lan.peer ? "已配对 · 当前离线" : "未配对"
+              lan.connected ? "有设备在线" : lan.peers?.length ? "已配对 · 当前离线" : "未配对"
             }}
           </dd>
         </div>
@@ -284,13 +282,19 @@ onUnmounted(() => {
       <p v-if="lan.lastError" class="error-message" role="alert">
         {{ lan.lastError }}
       </p>
-      <p v-if="lan.peer" class="notice">
-        配对设备：{{ lan.peer.name || lan.peer.id }} · {{ lan.peer.address }}:{{
-          lan.peer.port
-        }}<template v-if="!lan.connected"
-          >。采集端离线不代表该端没有报告。</template
-        >
-      </p>
+      <ul v-if="lan.peers?.length" class="lan-peer-list" aria-label="已配对设备">
+        <li v-for="peer in lan.peers" :key="peer.id">
+          <span>
+            <strong>{{ peer.name || peer.id }} · {{ peer.canQuery ? "报告来源" : "获授权的查看设备" }}</strong>
+            <small>{{ peer.address }}:{{ peer.port }} · {{ peer.connected ? "在线" : "离线" }}</small>
+            <small v-if="peer.lastError">{{ peer.lastError }}</small>
+          </span>
+          <button v-if="canManage" :disabled="!!busy || loading" @click="disconnectTarget = peer; disconnectOpen = true">
+            <Unplug :size="16" />移除此设备
+          </button>
+        </li>
+      </ul>
+      <p v-if="lan.peers?.length" class="field-help">离线不代表没有报告；其他来源仍可查看，来源未完整同步时禁止汇总导出。</p>
       <p v-if="!canManage" class="notice">
         此页面仅显示状态；请在服务电脑本机打开管理页面配置局域网。手机和远程页面不能配对或修改网卡。
       </p>
@@ -298,40 +302,39 @@ onUnmounted(() => {
         <form class="form-stack lan-form" @submit.prevent="configure">
           <div class="form-columns">
             <label
-              >角色<select v-model="mode" :disabled="!!lan.peer || !!busy">
-                <option value="standalone">单机</option>
-                <option value="host">主机 A</option>
-                <option value="collector">采集端 B</option>
+              >运行方式<select v-model="mode" :disabled="!!busy">
+                <option value="standalone" :disabled="!!lan.peers?.length">仅本机</option>
+                <option value="host">局域网汇总</option>
+                <option value="collector">局域网采集</option>
               </select></label
             >
             <label
               >设备名称<input v-model="name" maxlength="80" required
             /></label>
           </div>
-          <p v-if="lan.peer" class="field-help">更改角色前请先主动断开配对。</p>
+          <p class="field-help">两种局域网方式均可添加来源，也可向已授权设备提供本机报告。切换为仅本机前请移除所有设备。</p>
           <div class="button-row">
             <button class="primary" :disabled="!!busy || loading">
               保存局域网设置</button
             ><button
-              v-if="lan.peer"
+              v-if="lan.peers?.length || lan.joining?.status === 'pending'"
               type="button"
               :disabled="!!busy || loading"
-              @click="disconnectOpen = true"
+              @click="disconnectTarget = null; disconnectOpen = true"
             >
-              <Unplug :size="16" />断开配对
+              <Unplug :size="16" />断开全部并取消配对请求
             </button>
           </div>
         </form>
-        <div v-if="lan.mode === 'host' && !lan.peer" class="lan-actions">
-          <h3>发现采集端 B</h3>
+        <div v-if="lan.mode !== 'standalone' && (lan.peers?.length || 0) < 8" class="lan-actions">
+          <h3>添加报告来源</h3>
           <p class="field-help">
-            先在 B 端打开配对窗口，再自动发现。发现失败可填 B 的私网 IPv4
-            单独探测，不会扫描整个网段。
+            先在来源设备打开配对窗口，再自动发现。发现失败可填设备的私网 IPv4 单独探测，不会扫描整个网段。
           </p>
           <form class="input-action" @submit.prevent="discover">
             <input
               v-model="manualAddress"
-              aria-label="采集端私网IPv4"
+              aria-label="来源设备私网IPv4"
               inputmode="decimal"
               placeholder="可选：192.168.1.25"
             /><button :disabled="!!busy || loading">
@@ -344,7 +347,7 @@ onUnmounted(() => {
                 ><strong>{{ item.name }}</strong
                 ><small>{{ item.address }}:{{ item.port }}</small></span
               ><button
-                :disabled="!!busy || loading || pairingActive"
+                :disabled="!!busy || loading || pairingActive || lan.peers?.some(peer => peer.id === item.id)"
                 @click="join(item)"
               >
                 <Link :size="16" />连接
@@ -352,26 +355,26 @@ onUnmounted(() => {
             </li>
           </ul>
           <p v-else class="field-help">
-            尚未发现采集端。请确认 B 已启用采集端角色、网络地址和防火墙。
+            尚未发现设备。请确认对方已启用局域网连接、网络地址和防火墙。
           </p>
         </div>
         <div v-if="lan.joining" class="lan-actions" role="status">
-          <h3>主机 A 配对请求</h3>
+          <h3>添加来源配对请求</h3>
           <p>
             {{ lan.joining.name }} ·
             {{
               lan.joining.status === "pending"
-                ? "等待 B 端核对并批准"
+                ? "等待来源设备核对并批准"
                 : lan.joining.status
             }}
           </p>
           <p class="lan-code">{{ lan.joining.code }}</p>
           <p>
-            请核对两台设备的安全码一致，再在 B 端批准。无需在此输入任何令牌。
+            请核对两台设备的安全码一致，再在来源设备批准。无需在此输入任何令牌。
           </p>
         </div>
-        <div v-if="lan.mode === 'collector' && !lan.peer" class="lan-actions">
-          <h3>采集端 B 配对</h3>
+        <div v-if="lan.mode !== 'standalone' && (lan.peers?.length || 0) < 8" class="lan-actions">
+          <h3>授权其他设备查看本机报告</h3>
           <button
             :disabled="!!busy || loading || pairingActive"
             @click="mutate('pairing', '/lan/pairing')"
@@ -379,7 +382,7 @@ onUnmounted(() => {
             <ShieldCheck :size="17" />打开配对窗口
           </button>
           <p v-if="pairingActive" class="field-help">
-            配对窗口已打开，等待主机 A 请求；窗口到期会自动关闭。
+            配对窗口已打开，等待查看设备请求；窗口到期会自动关闭。
           </p>
           <article v-for="item in pending" :key="item.id" class="lan-request">
             <h3>请求设备：{{ item.name }}</h3>
@@ -408,7 +411,7 @@ onUnmounted(() => {
             未发现可用私网地址。
           </p>
           <p class="field-help">
-            两台电脑应处于同一局域网子网，且允许 TCP 3211 与 UDP
+            各设备应处于同一局域网子网，且允许 TCP 3211 与 UDP
             3212。无需开放管理端口 3210 到局域网或公网。
           </p>
         </div>
@@ -418,9 +421,9 @@ onUnmounted(() => {
         >
           <summary>可选：网线直连网卡向导</summary>
           <p class="field-help">
-            不会默认更改 IP。选择专用物理以太网卡，确认后才申请管理员授权。A
-            使用 192.168.250.1/24，B 使用 192.168.250.2/24；不设置网关或
-            DNS。已有非自动地址或默认网关的网卡不可配置。
+            仅适用于两台设备专用网线直连，不适用于多设备交换机组网。不会默认更改 IP；确认后才申请管理员授权。
+            汇总方式使用 192.168.250.1/24，采集方式使用 192.168.250.2/24，不设置网关或 DNS。
+            已有非自动地址或默认网关的网卡不可配置。
           </p>
           <button :disabled="nativeBusy" @click="loadAdapters">
             读取网卡列表</button
@@ -465,10 +468,10 @@ onUnmounted(() => {
     </template>
     <Modal
       v-if="disconnectOpen"
-      title="断开局域网配对？"
+      :title="disconnectTarget ? `移除 ${disconnectTarget.name}？` : '断开全部局域网设备？'"
       @close="disconnectOpen = false"
       ><p>
-        将撤销连接并清除配对凭据、当前连接和双机内存缓存；不会删除任何电脑的原始报告。再次连接需要重新核对安全码并批准。
+        {{ disconnectTarget ? '仅移除此设备的连接、配对凭据和来源缓存，其他来源继续保留。' : '撤销全部连接并取消待处理配对，清除所有局域网来源缓存。' }}不会删除任何电脑的原始报告；再次连接需要重新核对安全码并批准。
       </p>
       <template #footer
         ><button :disabled="!!busy" @click="disconnectOpen = false">取消</button

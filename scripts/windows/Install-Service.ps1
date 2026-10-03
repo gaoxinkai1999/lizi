@@ -4,8 +4,7 @@ param(
     [string] $ReportRoot,
     [string] $ReportRootFile,
     [string] $DataHome = (Join-Path $env:ProgramData 'Lizi'),
-    [string] $BootstrapUserSid,
-    [string] $TrustedCaFile
+    [string] $BootstrapUserSid
 )
 . (Join-Path $PSScriptRoot 'Common.ps1')
 Assert-Administrator
@@ -20,7 +19,7 @@ try {
     $runtime = Join-Path $InstallRoot 'runtime'
     $backend = Join-Path $InstallRoot 'backend'
     $wrapper = Join-Path $runtime 'LiziService.exe'
-    foreach ($path in @($wrapper, (Join-Path $runtime 'node.exe'), (Join-Path $runtime 'frpc.exe'), (Join-Path $backend 'packages/server/src/index.js'), (Join-Path $backend 'apps/web/dist/index.html'), (Join-Path $backend 'scripts/runtime/remote.js'))) {
+    foreach ($path in @($wrapper, (Join-Path $runtime 'node.exe'), (Join-Path $backend 'packages/server/src/index.js'), (Join-Path $backend 'apps/web/dist/index.html'))) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Throw-LiziError "Missing packaged resource: $path. Run Prepare-Resources.ps1 before packaging." }
     }
 
@@ -31,8 +30,6 @@ try {
     Set-PrivateAcl $DataHome $sid
     $logs = Get-LocalDirectory (Join-Path $DataHome 'logs') -Create
     Set-PrivateAcl $logs
-    $remote = Get-LocalDirectory (Join-Path $DataHome 'remote') -Create
-    Set-PrivateAcl $remote
     $registryPath = 'HKLM:\SOFTWARE\Lizi'
     $roots = @()
     if (Test-Path -LiteralPath $registryPath) {
@@ -81,13 +78,8 @@ try {
         LIZI_HOST = '127.0.0.1'; LIZI_PORT = '3210'; LIZI_SERVICE = '1'
         LIZI_WEB_DIST = (Join-Path $backend 'apps/web/dist')
         LIZI_ALLOWED_ROOTS = (ConvertTo-Json -InputObject @($roots) -Compress)
-        LIZI_FRPC_PATH = (Join-Path $runtime 'frpc.exe')
+        LIZI_MODE = 'client'
         NODE_ENV = 'production'
-    }
-    if ($TrustedCaFile) {
-        $caTarget = Join-Path $runtime 'trusted-frp-ca.pem'
-        Copy-Item -LiteralPath $TrustedCaFile -Destination $caTarget -Force
-        $environment.LIZI_FRP_CA_FILE = $caTarget
     }
     $xml = [xml]'<service />'
     function Add-Element([string] $Name, [string] $Value) {
@@ -97,7 +89,7 @@ try {
     }
     Add-Element 'id' 'LiziService'
     Add-Element 'name' 'Lizi Report Service'
-    Add-Element 'description' 'Local report indexing and authenticated HTTPS tunnel. Closing the desktop does not stop this service.'
+    Add-Element 'description' 'Local report acquisition, LAN viewing and durable HTTPS uploads. Closing the desktop does not stop this service.'
     Add-Element 'executable' (Join-Path $runtime 'node.exe')
     Add-Element 'arguments' ('"' + (Join-Path $backend 'packages/server/src/index.js') + '"')
     Add-Element 'workingdirectory' $backend

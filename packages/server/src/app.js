@@ -6,14 +6,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { isDate, todayString } from "@lizi/core";
-import { openDatabase } from "./database.js";
+import { openDatabase, getSetting, setSetting } from "./database.js";
 import { createDirectoryPolicy, httpError } from "./directories.js";
 import { createAuth, publicUser, requireSameOrigin } from "./auth.js";
 import { ReportStore } from "./reports.js";
 import { createLanManager } from "./lan.js";
 import { FederatedReportStore } from "./federated-reports.js";
 import { exportReports } from "./export.js";
-import { createRemoteManager } from "../../../scripts/runtime/remote.js";
+import { createSyncClient } from "./sync-client.js";
+import { createCloud } from "./cloud.js";
 
 const projectRoot = fileURLToPath(new URL("../../../", import.meta.url));
 async function ensureLocalAdminToken(home) {
@@ -46,21 +47,31 @@ export function parseReportQuery(input = {}) {
 }
 
 export async function createApplication(options = {}) {
+  const deploymentMode = options.mode ?? process.env.LIZI_MODE ?? "client";
+  if (!["client", "server"].includes(deploymentMode))
+    throw new Error("LIZI_MODE 必须为 client 或 server");
+  const isServer = deploymentMode === "server";
   const home = path.resolve(
-    options.home ?? process.env.LIZI_HOME ?? path.join(projectRoot, ".lizi"),
+    options.home ?? process.env.LIZI_HOME ?? path.join(projectRoot, isServer ? ".lizi-server" : ".lizi"),
   );
   const port = Number(options.port ?? process.env.LIZI_PORT ?? 3210);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error("LIZI_PORT 无效");
   await fs.mkdir(home, { recursive: true, mode: 0o700 });
   if (process.platform !== "win32") await fs.chmod(home, 0o700);
-  const localAdminToken = await ensureLocalAdminToken(home);
+  const localAdminToken = isServer ? null : await ensureLocalAdminToken(home);
   const db = openDatabase(home);
-  const directories = await createDirectoryPolicy(
+  const previousMode = getSetting(db, "deploymentMode");
+  if (previousMode && previousMode !== deploymentMode) {
+    db.close();
+    throw new Error("客户端和服务器必须使用独立数据目录，禁止混用已有数据库");
+  }
+  setSetting(db, "deploymentMode", deploymentMode);
+  if (isServer) setSetting(db, "authenticationEnabled", true);
+  const directories = isServer ? null : await createDirectoryPolicy(
     home,
     options.allowedRoots ?? process.env.LIZI_ALLOWED_ROOTS,
   );
-  const remote = createRemoteManager({ home, port });
   const clients = new Set();
   const auth = await createAuth(
     db,
@@ -79,24 +90,33 @@ export async function createApplication(options = {}) {
       clients.clear();
     },
   );
-  const localStore = new ReportStore(db, directories);
+  let localStore;
   let lan;
+  let sync;
+  let cloud;
+  let store;
   try {
-    lan = await createLanManager({
-      home,
-      store: localStore,
-      options: options.lan ?? {},
-    });
+    if (isServer) {
+      cloud = await createCloud({ home, db, options: options.cloud ?? {} });
+      store = cloud.store;
+    } else {
+      localStore = new ReportStore(db, directories);
+      lan = await createLanManager({ home, store: localStore, options: options.lan ?? {} });
+      store = new FederatedReportStore(localStore, lan);
+      sync = await createSyncClient({ home, db, localStore,
+        options: { ...options.sync, deviceId: lan.getSettings().deviceId } });
+    }
   } catch (error) {
-    await localStore.close();
-    await remote.stop();
+    await sync?.close();
+    await lan?.close();
+    await localStore?.close();
     db.close();
     throw error;
   }
-  const store = new FederatedReportStore(localStore, lan);
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", "loopback");
+  const trustProxy = isServer ? (options.trustProxy ?? process.env.LIZI_TRUST_PROXY ?? "loopback") : "loopback";
+  app.set("trust proxy", trustProxy === "1" ? 1 : trustProxy);
   app.use(
     helmet({
       contentSecurityPolicy: {
@@ -127,6 +147,7 @@ export async function createApplication(options = {}) {
     res.setHeader("Cache-Control", "no-store");
     next();
   });
+  if (isServer) app.use("/api/ingest", cloud.machineRouter);
   app.use("/api", requireSameOrigin);
   app.use(express.json({ limit: "1mb", strict: true }));
   app.use("/api", (req, res, next) => {
@@ -141,14 +162,13 @@ export async function createApplication(options = {}) {
   app.get("/api/auth/state", (req, res) => {
     const user = auth.identity(req);
     res.json({
+      deploymentMode,
       initialized: auth.initialized(),
       authenticationEnabled: auth.authenticationEnabled(),
       user: user ? publicUser(user) : null,
       dataRoot: user ? store.root : null,
-      dataScope: user ? lan.getSettings().epoch : null,
-      transientReports: Boolean(
-        user && lan.getSettings().mode === "host" && lan.getSettings().peer,
-      ),
+      dataScope: user ? (lan?.getSettings().epoch ?? 0) : null,
+      transientReports: Boolean(user && lan?.getSettings().peers.some((peer) => peer.canQuery)),
       today: todayString(),
     });
   });
@@ -156,7 +176,8 @@ export async function createApplication(options = {}) {
   app.post("/api/auth/setup", auth.setup);
   app.post("/api/auth/login", auth.login);
   app.use("/api", auth.guard);
-  app.put("/api/access", auth.admin, requireLocalAdmin, auth.setAccess);
+  if (!isServer) app.put("/api/access", auth.admin, requireLocalAdmin, auth.setAccess);
+  if (isServer) app.use("/api/devices", auth.admin, cloud.adminRouter);
   app.post("/api/auth/logout", auth.logout);
   app.post("/api/auth/password", auth.changePassword);
   function assertCurrentIdentity(req) {
@@ -206,12 +227,14 @@ export async function createApplication(options = {}) {
   });
   app.post("/api/reports/lease", (req, res) => {
     const clientId = reportClient(req, true);
-    if (req.body.release === true) store.release(clientId);
-    else store.touch(parseReportQuery(req.body), clientId);
+    if (!isServer) {
+      if (req.body.release === true) store.release(clientId);
+      else store.touch(parseReportQuery(req.body), clientId);
+    }
     res.json({ ok: true });
   });
   app.post("/api/reports/release", (req, res) => {
-    store.release(reportClient(req, true));
+    if (!isServer) store.release(reportClient(req, true));
     res.json({ ok: true });
   });
   app.post("/api/reports/export", async (req, res) => {
@@ -247,6 +270,7 @@ export async function createApplication(options = {}) {
     }
   });
   function publicLanStatus() {
+    if (!lan) return null;
     const { mode, name, connected, lastError } = lan.getStatus();
     return {
       mode,
@@ -254,7 +278,7 @@ export async function createApplication(options = {}) {
       connected,
       lastError: lastError ? "局域网连接异常" : null,
       listening: false,
-      peer: null,
+      peers: [],
       addresses: [],
       discovered: [],
       pairing: { openUntil: null, pending: [] },
@@ -263,45 +287,58 @@ export async function createApplication(options = {}) {
   }
   function status() {
     return {
-      version: "2.2.1",
+      version: "3.0.0",
+      deploymentMode,
       ...store.status(),
       service: {
         mode: process.env.LIZI_SERVICE === "1" ? "service" : "standalone",
         uptime: Math.floor(process.uptime()),
       },
-      remote: remote.getStatus(),
+      sync: sync?.getStatus() ?? null,
+      devices: cloud?.status() ?? null,
       lan: publicLanStatus(),
-      cacheEpoch: lan.getSettings().epoch,
+      cacheEpoch: lan?.getSettings().epoch ?? 0,
     };
   }
   app.get("/api/status", (req, res) => res.json(status()));
   function settings() {
     return {
+      deploymentMode,
       dataPath: store.root,
-      allowedRoots: directories.allowedRoots,
+      allowedRoots: directories?.allowedRoots ?? [],
       authenticationEnabled: auth.authenticationEnabled(),
-      remote: remote.getSettings(),
     };
   }
   app.get("/api/settings", auth.admin, (req, res) => res.json(settings()));
-  app.put("/api/settings", auth.admin, requireLocalAdmin, async (req, res) => {
-    await store.setRoot(req.body.dataPath);
-    res.json(settings());
-  });
-  app.get("/api/directories", auth.admin, async (req, res) =>
-    res.json(await directories.browse(req.query.path)),
-  );
-  app.post("/api/scan", auth.admin, requireLocalAdmin, async (req, res) => {
-    if (!store.root) throw httpError(400, "请先配置报告目录");
-    void store
-      .scan()
-      .catch((error) => console.error("日期目录扫描失败：", error));
-    res.status(202).json({ ok: true, scanning: true });
-  });
-  app.put("/api/remote", auth.admin, requireLocalAdmin, async (req, res) => {
-    await remote.configure(req.body);
-    res.json(settings());
-  });
+  if (!isServer) {
+    app.put("/api/settings", auth.admin, requireLocalAdmin, async (req, res) => {
+      await store.setRoot(req.body.dataPath);
+      res.json(settings());
+    });
+    app.get("/api/directories", auth.admin, async (req, res) =>
+      res.json(await directories.browse(req.query.path)),
+    );
+    app.post("/api/scan", auth.admin, requireLocalAdmin, async (req, res) => {
+      if (!store.root) throw httpError(400, "请先配置报告目录");
+      void store.scan().catch((error) => console.error("日期目录扫描失败：", error));
+      res.status(202).json({ ok: true, scanning: true });
+    });
+    app.get("/api/sync", (req, res) => res.json({
+      settings: sync.getSettings(), status: sync.getStatus(),
+      canManage: localAdminAuthorized(req) && req.user?.role === "admin",
+    }));
+    app.put("/api/sync", auth.admin, requireLocalAdmin, async (req, res) => {
+      await sync.configure(req.body);
+      res.json({ settings: sync.getSettings(), status: sync.getStatus(), canManage: true });
+    });
+    app.post("/api/sync/retry", auth.admin, requireLocalAdmin, async (req, res) => {
+      await sync.retry();
+      res.json({ status: sync.getStatus() });
+    });
+    app.post("/api/sync/backfill", auth.admin, requireLocalAdmin, async (req, res) => {
+      res.status(202).json(await sync.backfill(req.body));
+    });
+  }
   function localLanAdministration(req) {
     const address = req.socket.remoteAddress;
     if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(address))
@@ -320,6 +357,7 @@ export async function createApplication(options = {}) {
     }
   }
   function localAdminAuthorized(req) {
+    if (!localAdminToken) return false;
     if (!localLanAdministration(req)) return false;
     const presented = req.get("X-Lizi-Local-Admin");
     if (!presented || !/^[A-Za-z0-9_-]{43}$/.test(presented)) return false;
@@ -339,31 +377,28 @@ export async function createApplication(options = {}) {
     return { ...(canManage ? lan.getStatus() : publicLanStatus()), canManage };
   }
   const localLanOnly = requireLocalAdmin;
-  app.get("/api/lan", (req, res) => res.json(lanStatus(req)));
-  app.put("/api/lan", auth.admin, localLanOnly, async (req, res) => {
-    await lan.configure(req.body);
-    res.json(lanStatus(req));
-  });
-  for (const [route, action] of [
-    ["discover", "discover"],
-    ["pairing", "openPairing"],
-    ["join", "join"],
-    ["approve", "approve"],
-  ]) {
-    app.post(
-      `/api/lan/${route}`,
-      auth.admin,
-      localLanOnly,
-      async (req, res) => {
+  if (!isServer) {
+    app.get("/api/lan", (req, res) => res.json(lanStatus(req)));
+    app.put("/api/lan", auth.admin, localLanOnly, async (req, res) => {
+      await lan.configure(req.body);
+      res.json(lanStatus(req));
+    });
+    for (const [route, action] of [
+      ["discover", "discover"],
+      ["pairing", "openPairing"],
+      ["join", "join"],
+      ["approve", "approve"],
+    ]) {
+      app.post(`/api/lan/${route}`, auth.admin, localLanOnly, async (req, res) => {
         await lan[action](req.body);
         res.json(lanStatus(req));
-      },
-    );
+      });
+    }
+    app.delete("/api/lan/peer", auth.admin, localLanOnly, async (req, res) => {
+      await lan.disconnect(req.body);
+      res.json(lanStatus(req));
+    });
   }
-  app.delete("/api/lan/peer", auth.admin, localLanOnly, async (req, res) => {
-    await lan.disconnect();
-    res.json(lanStatus(req));
-  });
   app.get("/api/users", auth.admin, auth.listUsers);
   app.post("/api/users", auth.admin, auth.addUser);
   app.patch("/api/users/:id", auth.admin, auth.updateUser);
@@ -417,6 +452,9 @@ export async function createApplication(options = {}) {
     const current = status();
     for (const client of clients) sendEvent(client, "status", current);
   });
+  sync?.on("status", () => {
+    for (const client of clients) sendEvent(client, "status", status());
+  });
   app.use("/api", (req, res, next) => next(httpError(404, "接口不存在")));
   const webDist = path.resolve(
     options.webDist ??
@@ -466,7 +504,7 @@ export async function createApplication(options = {}) {
             : error.message,
     });
   });
-  const ready = store.start();
+  const ready = store.start().then(() => sync?.start());
   return {
     app,
     home,
@@ -475,12 +513,16 @@ export async function createApplication(options = {}) {
     store,
     lan,
     localStore,
+    sync,
+    cloud,
+    deploymentMode,
     ready,
     async close() {
       for (const client of clients) client.res.end();
-      await lan.close();
-      await store.close();
-      await remote.stop();
+      await sync?.close();
+      await lan?.close();
+      if (cloud) await cloud.close();
+      else await store.close();
       db.close();
     },
   };

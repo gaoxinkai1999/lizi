@@ -3,13 +3,17 @@ import { createApplication } from "./app.js";
 const runtime = await createApplication();
 const host = process.env.LIZI_HOST ?? "127.0.0.1";
 const server = runtime.app.listen(runtime.port, host, () => {
-  console.log(`粒子强度后台已启动 http://${host}:${runtime.port}`);
+  console.log(`粒子报告${runtime.deploymentMode === "server" ? "服务器" : "客户端后台"}已启动 http://${host}:${runtime.port}`);
   console.log(`持久数据目录：${runtime.home}`);
 });
 server.requestTimeout = 30000;
 server.headersTimeout = 15000;
 server.keepAliveTimeout = 5000;
-runtime.ready.catch((error) => console.error("初始报告补扫失败：", error));
+runtime.ready.catch(async (error) => {
+  console.error("报告服务初始化失败：", error);
+  process.exitCode = 1;
+  await shutdown();
+});
 server.on("error", async (error) => {
   console.error("后台监听失败：", error);
   await runtime.close();

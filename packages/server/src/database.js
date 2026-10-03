@@ -15,6 +15,7 @@ export function openDatabase(home) {
   locations.set(db, location);
   db.exec(`
     PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=FULL;
     PRAGMA foreign_keys=ON;
     PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);

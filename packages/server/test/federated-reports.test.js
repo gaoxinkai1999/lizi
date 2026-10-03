@@ -32,19 +32,27 @@ class LanStub extends EventEmitter {
       deviceId: "host-a",
       name: "主机A",
       epoch: 1,
-      peer: { id: "collector-b", name: "采集端B" },
+      peers: [{ id: "collector-b", name: "采集端B", canQuery: true }],
     };
     this.connected = true;
     this.rows = [];
     this.errors = [];
     this.calls = [];
     this.gate = null;
+    this.sources = new Map();
   }
   getSettings() {
     return this.settings;
   }
   getStatus() {
-    return { ...this.settings, connected: this.connected };
+    return {
+      ...this.settings,
+      connected: this.connected,
+      peers: this.settings.peers.map((peer) => ({
+        ...peer,
+        connected: this.sources.get(peer.id)?.connected ?? this.connected,
+      })),
+    };
   }
   hold() {
     let resume;
@@ -56,16 +64,17 @@ class LanStub extends EventEmitter {
       resume();
     };
   }
-  async fetchReports(params, { signal }) {
-    this.calls.push({ params, signal });
+  async fetchReports(params, { peerId, signal }) {
+    this.calls.push({ params, peerId, signal });
     await this.gate;
-    if (!this.connected) throw new Error("采集端连接中断");
+    const source = this.sources.get(peerId);
+    if (!(source?.connected ?? this.connected)) throw new Error("来源连接中断");
     return {
-      reports: structuredClone(filterReports(this.rows, params)),
-      sourceId: "collector-b",
-      sourceName: "采集端B",
+      reports: structuredClone(filterReports(source?.rows ?? this.rows, params)),
+      sourceId: peerId,
+      sourceName: this.settings.peers.find((peer) => peer.id === peerId).name,
       revision: this.calls.length,
-      errors: this.errors,
+      errors: source?.errors ?? this.errors,
     };
   }
   connection(connected) {
@@ -272,7 +281,7 @@ test("共享日期租约、四scope上限、临时API租约及超时互不抢占
   store.touch(query, "fresh-viewer");
   assert.equal(store.status().cache.clients, 1);
   assert.equal(store.status().cache.scopes, 1);
-  lan.settings = { ...lan.settings, epoch: 2, peer: null };
+  lan.settings = { ...lan.settings, epoch: 2, peers: [] };
   lan.emit("configuration");
   assert.equal(store.status().cacheEpoch, 2);
   assert.equal(store.status().cache.scopes, 0);
@@ -450,13 +459,13 @@ test("同一scope在途变更合并成一次后继同步且close后不再请求"
   assert.equal(store.status().cache.bytes, 0);
 });
 
-test("单机与采集模式无需远端租约，仍有原始ID及默认总分析排除语义", async (t) => {
+test("没有报告来源时各模式无需远端租约，保留本机ID及默认总分析排除语义", async (t) => {
   const { store, lan, write, index } = await fixture(t);
   await write("local.txt", "1 local");
   await write("total.txt", "1 总");
   const original = await index();
-  for (const mode of ["standalone", "collector"]) {
-    lan.settings = { ...lan.settings, mode };
+  for (const mode of ["standalone", "collector", "host"]) {
+    lan.settings = { ...lan.settings, mode, peers: [] };
     lan.emit("configuration");
     const page = await store.query(query);
     assert.equal(page.transient, false);
@@ -473,4 +482,63 @@ test("单机与采集模式无需远端租约，仍有原始ID及默认总分析
   }
   assert.equal(lan.calls.length, 0);
   assert.equal(store.status().cache.clients, 0);
+});
+
+test("多个来源ID隔离、单源离线不丢其他数据、定向移除与导出租约释放", async (t) => {
+  const { store, lan, write, index } = await fixture(t);
+  await write("local.txt", "1 local");
+  const local = await index();
+  lan.rows = [remote(1, "2 first")];
+  lan.rows[0].id = local.reports[0].id;
+  const initial = await ready(store);
+  const originalId = initial.reports.find((row) => row.sourceId === "collector-b").id;
+  for (const [id, name] of [["collector-c", "第三设备"], ["collector-d", "第四设备"]]) {
+    lan.settings.peers.push({ id, name, canQuery: true });
+    lan.sources.set(id, { connected: true, rows: [{ ...lan.rows[0], sampleName: name }] });
+  }
+  lan.settings.epoch++;
+  lan.emit("configuration");
+  const combined = await ready(store);
+  assert.deepEqual(new Set(combined.reports.map((row) => row.sourceId)),
+    new Set(["host-a", "collector-b", "collector-c", "collector-d"]));
+  assert.equal(new Set(combined.reports.map((row) => row.id)).size, 4);
+  assert.equal(combined.reports.find((row) => row.sourceId === "collector-b").id, originalId);
+  const snapshot = await store.exportSnapshot(query, { allSelected: true });
+  const pinned = await collect(snapshot);
+  lan.sources.get("collector-c").connected = false;
+  lan.sources.get("collector-d").rows = [remote(2, "4 refreshed")];
+  lan.emit("change");
+  const offline = await until(() => store.query(query), (page) => !page.indexing && page.incomplete);
+  assert.equal(offline.sources.find((source) => source.id === "collector-c").state, "offline");
+  assert.equal(offline.sources.find((source) => source.id === "collector-d").state, "ready");
+  assert.ok(offline.reports.some((row) => row.sampleName === "4 refreshed"));
+  assert.ok(offline.reports.some((row) => row.sampleName === "第三设备"));
+  assert.deepEqual(await collect(snapshot), pinned);
+  await assert.rejects(store.exportSnapshot(query), { status: 503 });
+  await snapshot.close();
+  lan.settings.peers = lan.settings.peers.filter((peer) => peer.id !== "collector-c");
+  lan.settings.epoch++;
+  lan.emit("configuration");
+  const remaining = await ready(store);
+  assert.deepEqual(new Set(remaining.reports.map((row) => row.sourceId)),
+    new Set(["host-a", "collector-b", "collector-d"]));
+  assert.equal(remaining.reports.find((row) => row.sourceId === "collector-b").id, originalId);
+  assert.ok(store.status().cache.bytes <= store.status().cache.maxBytes);
+  store.release(query.clientId);
+  assert.equal(store.status().cache.bytes, 0);
+  assert.equal(store.status().cache.clients, 0);
+});
+
+test("释放多源在途日期租约后不发起后续来源请求", async (t) => {
+  const { store, lan, index } = await fixture(t);
+  await index();
+  lan.settings.peers.push({ id: "collector-c", name: "第三设备", canQuery: true });
+  const resume = lan.hold();
+  await store.query(query);
+  await until(async () => lan.calls.length, (count) => count === 1);
+  store.release(query.clientId);
+  resume();
+  await until(async () => store.status().cache.reservedBytes, (bytes) => bytes === 0);
+  assert.equal(lan.calls.length, 1);
+  assert.equal(store.status().cache.bytes, 0);
 });

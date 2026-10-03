@@ -20,7 +20,6 @@ for (const file of ["package.json", "package-lock.json"])
 for (const directory of [
   "packages/server",
   "packages/core",
-  "scripts/runtime",
   "apps/web/dist",
 ]) {
   await cp(join(root, directory), join(destination, directory), {

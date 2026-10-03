@@ -72,7 +72,7 @@ export class FederatedReportStore extends EventEmitter {
         lan,
         "configuration",
         () => {
-          this.clearScopes();
+          this.reconcileSources();
           for (const snapshot of this.snapshots)
             void snapshot.close().catch(() => {});
           this.connected = Boolean(lan.getStatus().connected);
@@ -119,9 +119,49 @@ export class FederatedReportStore extends EventEmitter {
     return this.status();
   }
 
+  peers() {
+    return this.lan.getSettings().peers.filter((peer) => peer.canQuery);
+  }
+
   paired() {
-    const settings = this.lan.getSettings();
-    return settings.mode === "host" && Boolean(settings.peer);
+    return this.peers().length > 0;
+  }
+
+  reconcileSources() {
+    const ids = new Set(this.peers().map((peer) => peer.id));
+    for (const scope of this.scopes.values()) {
+      for (const [id, source] of scope.sources) {
+        if (ids.has(id)) continue;
+        source.controller?.abort();
+        this.unref(source.generation);
+        scope.sources.delete(id);
+        this.unref(scope.merged);
+        scope.merged = null;
+      }
+      scope.pending = true;
+      scope.loading = true;
+    }
+    if (!ids.size) this.clearScopes();
+    else this.schedule();
+  }
+
+  capture(scope) {
+    if (!scope) return null;
+    if (scope.merged) {
+      scope.merged.refs++;
+      return scope.merged;
+    }
+    const children = [...scope.sources.values()].map((source) => source.generation).filter(Boolean);
+    const count = children.reduce((sum, generation) => sum + generation.rows.length, 0);
+    const bytes = count * 8;
+    if (this.memoryBytes() + bytes > this.maxBytes)
+      throw httpError(503, "局域网缓存内存已达上限");
+    const rows = children.flatMap((generation) => generation.rows).sort(compare);
+    for (const child of children) child.refs++;
+    const generation = { rows, bytes, refs: 2, children };
+    this.generations.add(generation);
+    scope.merged = generation;
+    return generation;
   }
 
   memoryBytes() {
@@ -145,7 +185,7 @@ export class FederatedReportStore extends EventEmitter {
         reservedBytes: this.reservedBytes,
         snapshots: this.snapshots.size + this.openingSnapshots,
         reports: [...this.scopes.values()].reduce(
-          (sum, scope) => sum + (scope.generation?.rows.length ?? 0),
+          (sum, scope) => sum + [...scope.sources.values()].reduce((count, source) => count + (source.generation?.rows.length ?? 0), 0),
           0,
         ),
       },
@@ -178,13 +218,13 @@ export class FederatedReportStore extends EventEmitter {
     const id = clientId || TEMPORARY_CLIENT;
     const previous = this.clients.get(id);
     if (!previous && this.clients.size >= this.maxClients)
-      throw httpError(503, "双机报告查看客户端已达上限");
+      throw httpError(503, "局域网报告查看客户端已达上限");
     let scope = this.scopes.get(key);
     if (!scope && this.scopes.size >= this.maxScopes) {
       const replaceable =
         previous && this.scopes.get(previous.key)?.clients.size === 1;
       if (!replaceable)
-        throw httpError(503, "同时最多查看四个双机日期班次，请先关闭其他查询");
+        throw httpError(503, "同时最多查看四个局域网日期班次，请先关闭其他查询");
     }
     if (previous && previous.key !== key) this.release(id);
     if (!scope) {
@@ -192,11 +232,9 @@ export class FederatedReportStore extends EventEmitter {
         key,
         query,
         clients: new Set(),
-        generation: null,
+        sources: new Map(),
         pending: true,
         loading: true,
-        warning: null,
-        controller: null,
       };
       this.scopes.set(key, scope);
       this.schedule();
@@ -215,9 +253,13 @@ export class FederatedReportStore extends EventEmitter {
     scope.clients.delete(clientId);
     if (scope.clients.size) return;
     this.scopes.delete(client.key);
-    scope.controller?.abort();
-    this.unref(scope.generation);
-    scope.generation = null;
+    for (const source of scope.sources.values()) {
+      source.controller?.abort();
+      this.unref(source.generation);
+    }
+    scope.sources.clear();
+    this.unref(scope.merged);
+    scope.merged = null;
   }
 
   clearScopes() {
@@ -225,8 +267,10 @@ export class FederatedReportStore extends EventEmitter {
   }
 
   unref(generation) {
-    if (generation && --generation.refs === 0)
+    if (generation && --generation.refs === 0) {
       this.generations.delete(generation);
+      for (const child of generation.children ?? []) this.unref(child);
+    }
   }
 
   invalidate() {
@@ -251,129 +295,113 @@ export class FederatedReportStore extends EventEmitter {
     if (this.closed || this.refreshing) return;
     this.refreshing = true;
     try {
+      // A single transport flight across every peer and scope leaves capacity
+      // for a direct LAN request, without a peers × scopes promise fan-out.
       for (const scope of this.scopes.values()) {
         if (!scope.pending) continue;
         scope.pending = false;
-        const controller = new AbortController();
-        scope.controller = controller;
-        let reserved = false;
-        try {
-          if (!this.lan.getStatus().connected)
-            throw httpError(503, "采集端离线，显示上次缓存的数据");
-          // Reserve one bounded transport result before allocating it. Old generations
-          // held by an export/query remain charged until their final reader releases.
-          if (this.memoryBytes() + this.maxRemoteBytes > this.maxBytes)
-            throw httpError(
-              503,
-              "双机缓存内存已达上限，请关闭导出或其他日期查询",
-            );
-          this.reservedBytes += this.maxRemoteBytes;
-          reserved = true;
-          const result = await this.lan.fetchReports(scope.query, {
-            signal: controller.signal,
-          });
-          if (
-            this.closed ||
-            this.scopes.get(scope.key) !== scope ||
-            controller.signal.aborted
-          )
-            continue;
-          if (!Array.isArray(result.reports) || result.reports.length > 20000)
-            throw httpError(413, "采集端报告数量超过缓存上限");
-          const { peer } = this.lan.getSettings();
-          if (result.sourceId !== peer.id)
-            throw httpError(409, "采集端身份已变化，请重新查询");
-          const { start, end } = shiftBounds(
-            scope.query.date,
-            scope.query.shift,
-          );
-          const ids = new Set();
-          let bytes = 0;
-          const rows = [];
-          for (const report of result.reports) {
-            if (
-              !/^[a-f0-9]{32}$/.test(report.id) ||
-              !Array.isArray(report.testResults) ||
-              !Array.isArray(report.segmentInfoList)
-            )
-              throw httpError(502, "采集端报告格式无效");
-            const timestamp = `${report.date}T${report.time}`;
-            if (
-              timestamp < start ||
-              timestamp >= end ||
-              (scope.query.excludeAggregate && report.isAggregate)
-            )
-              continue;
-            const id = createHash("sha256")
-              .update(`${peer.id}\0${report.id}`)
-              .digest("hex")
-              .slice(0, 32);
-            if (ids.has(id)) throw httpError(502, "采集端返回重复报告");
-            ids.add(id);
-            const row = {
-              ...report,
-              id,
-              sourceId: peer.id,
-              sourceName: result.sourceName || peer.name,
-            };
-            // Account serialized payload plus row/reference bookkeeping. This is a
-            // bounded cache budget, not a claim about V8's exact heap overhead.
-            bytes += Buffer.byteLength(JSON.stringify(row)) + 128;
-            if (bytes > this.maxRemoteBytes)
-              throw httpError(413, "采集端报告超过单次缓存内存上限");
-            rows.push(freezeReport(row));
-          }
-          rows.sort(compare);
-          const generation = { rows: Object.freeze(rows), bytes, refs: 1 };
-          this.unref(scope.generation);
-          scope.generation = generation;
-          this.generations.add(generation);
-          scope.warning = result.errors?.length
-            ? "采集端部分报告未完整读取，请检查采集端索引状态"
-            : null;
-        } catch (error) {
-          if (
-            this.scopes.get(scope.key) === scope &&
-            !controller.signal.aborted
-          )
-            scope.warning = error.message || "采集端同步失败";
-        } finally {
-          if (reserved) this.reservedBytes -= this.maxRemoteBytes;
-          scope.controller = null;
-          scope.loading = scope.pending;
-          if (this.scopes.get(scope.key) === scope) this.changed();
+        for (const peer of this.peers()) {
+          if (this.closed || this.scopes.get(scope.key) !== scope) break;
+          if (!this.peers().some((entry) => entry.id === peer.id)) continue;
+          await this.refreshSource(scope, peer);
         }
+        scope.loading = scope.pending;
+        if (this.scopes.get(scope.key) === scope) this.changed();
       }
     } finally {
       this.refreshing = false;
-      if ([...this.scopes.values()].some((scope) => scope.pending))
-        this.schedule();
+      if ([...this.scopes.values()].some((scope) => scope.pending)) this.schedule();
+    }
+  }
+
+  async refreshSource(scope, peer) {
+    let source = scope.sources.get(peer.id);
+    if (!source) {
+      source = { generation: null, warning: null, controller: null };
+      scope.sources.set(peer.id, source);
+    }
+    const controller = new AbortController();
+    source.controller = controller;
+    let reserved = false;
+    try {
+      if (!this.lan.getStatus().peers.find((entry) => entry.id === peer.id)?.connected)
+        throw httpError(503, "设备离线，显示上次缓存的数据");
+      // Charge the bounded transport before allocating; leased old generations
+      // remain charged until their last query/export releases them.
+      if (this.memoryBytes() + this.maxRemoteBytes > this.maxBytes)
+        throw httpError(503, "局域网缓存内存已达上限，请关闭导出或其他日期查询");
+      this.reservedBytes += this.maxRemoteBytes;
+      reserved = true;
+      const result = await this.lan.fetchReports(scope.query, {
+        signal: controller.signal,
+        peerId: peer.id,
+      });
+      if (this.closed || this.scopes.get(scope.key) !== scope ||
+          scope.sources.get(peer.id) !== source || controller.signal.aborted) return;
+      if (!Array.isArray(result.reports) || result.reports.length > 20000)
+        throw httpError(413, "来源报告数量超过缓存上限");
+      if (result.sourceId !== peer.id)
+        throw httpError(409, "来源身份已变化，请重新查询");
+      const { start, end } = shiftBounds(scope.query.date, scope.query.shift);
+      const ids = new Set();
+      let bytes = 0;
+      const rows = [];
+      for (const report of result.reports) {
+        if (!/^[a-f0-9]{32}$/.test(report.id) ||
+            !Array.isArray(report.testResults) || !Array.isArray(report.segmentInfoList))
+          throw httpError(502, "来源报告格式无效");
+        const timestamp = `${report.date}T${report.time}`;
+        if (timestamp < start || timestamp >= end ||
+            (scope.query.excludeAggregate && report.isAggregate)) continue;
+        const id = createHash("sha256").update(`${peer.id}\0${report.id}`).digest("hex").slice(0, 32);
+        if (ids.has(id)) throw httpError(502, "来源返回重复报告");
+        ids.add(id);
+        const row = { ...report, id, sourceId: peer.id, sourceName: result.sourceName || peer.name };
+        // Payload plus bookkeeping: a cache budget, not exact V8 heap size.
+        bytes += Buffer.byteLength(JSON.stringify(row)) + 128;
+        if (bytes > this.maxRemoteBytes)
+          throw httpError(413, "来源报告超过单次缓存内存上限");
+        rows.push(freezeReport(row));
+      }
+      rows.sort(compare);
+      const generation = { rows: Object.freeze(rows), bytes, refs: 1 };
+      this.unref(scope.merged);
+      scope.merged = null;
+      this.unref(source.generation);
+      source.generation = generation;
+      this.generations.add(generation);
+      source.warning = result.errors?.length ? "部分报告未完整读取，请检查来源索引状态" : null;
+    } catch (error) {
+      if (this.scopes.get(scope.key) === scope && !controller.signal.aborted)
+        source.warning = error.message || "设备同步失败";
+    } finally {
+      if (reserved) this.reservedBytes -= this.maxRemoteBytes;
+      source.controller = null;
     }
   }
 
   metadata(scope) {
     const settings = this.lan.getSettings();
-    const sources = [
-      { id: settings.deviceId, name: settings.name, state: "local" },
-    ];
+    const status = this.lan.getStatus();
+    const sources = [{ id: settings.deviceId, name: settings.name, state: "local" }];
     const warnings = [];
-    if (this.paired()) {
-      const online = this.lan.getStatus().connected;
-      let warning = scope?.warning;
-      if (!online) warning = "采集端离线，远端数据可能不完整；已有缓存予以保留";
-      if (warning) warnings.push(warning);
+    for (const peer of this.peers()) {
+      const source = scope?.sources.get(peer.id);
+      const online = status.peers.find((entry) => entry.id === peer.id)?.connected;
+      let warning = source?.warning;
+      if (!online) warning = "设备离线，数据可能不完整；已有缓存予以保留";
+      if (warning) warnings.push(`${peer.name}：${warning}`);
       let state = "ready";
       if (!online) state = "offline";
-      else if (scope?.loading || !scope?.generation) state = "syncing";
       else if (warning) state = "error";
-      sources.push({
-        id: settings.peer.id,
-        name: settings.peer.name,
-        state,
-        ...(warning ? { warning } : {}),
-      });
+      else if (scope?.loading || !source?.generation) state = "syncing";
+      sources.push({ id: peer.id, name: peer.name, state, ...(warning ? { warning } : {}) });
     }
     return { transient: this.paired(), sources, warnings };
+  }
+
+  incomplete(scope) {
+    return this.metadata(scope).sources.some((source) => !["local", "ready"].includes(source.state));
   }
 
   async query(params) {
@@ -381,8 +409,7 @@ export class FederatedReportStore extends EventEmitter {
     let generation;
     try {
       const page = await this.local.query(params);
-      generation = scope?.generation;
-      if (generation) generation.refs += 1;
+      generation = this.capture(scope);
       const revision = this.revision;
       const settings = this.lan.getSettings();
       const localRow = (row) => ({
@@ -460,7 +487,7 @@ export class FederatedReportStore extends EventEmitter {
         }
       }
       if (scope && this.scopes.get(scope.key) !== scope)
-        throw httpError(409, "查询日期或双机配置已经变化，请重新查询");
+        throw httpError(409, "查询日期或局域网配置已经变化，请重新查询");
       let pageBytes = 0;
       for (const report of reports) {
         pageBytes += Buffer.byteLength(JSON.stringify(report));
@@ -473,13 +500,7 @@ export class FederatedReportStore extends EventEmitter {
         total,
         revision,
         indexing: page.indexing || Boolean(scope?.loading),
-        incomplete: Boolean(
-          scope &&
-          (!scope.generation ||
-            scope.loading ||
-            scope.warning ||
-            !this.lan.getStatus().connected),
-        ),
+        incomplete: this.incomplete(scope),
         ...this.metadata(scope),
       };
     } finally {
@@ -495,15 +516,12 @@ export class FederatedReportStore extends EventEmitter {
     const settings = this.lan.getSettings();
     const query = scopeQuery(params);
     const scope = this.paired() ? this.scopes.get(keyOf(query)) : null;
-    if (this.paired()) {
-      if (!this.lan.getStatus().connected)
-        throw httpError(503, "采集端离线，不能导出不完整的双机报告");
-      if (!scope?.generation || scope.loading)
-        throw httpError(409, "采集端报告尚未同步完成，请先查询并稍后导出");
-      if (scope.warning) throw httpError(503, scope.warning);
-    }
-    let generation = scope?.generation;
-    if (generation) generation.refs += 1;
+    const sources = this.metadata(scope).sources;
+    if (sources.some((source) => ["offline", "error"].includes(source.state)))
+      throw httpError(503, "局域网来源离线或同步失败，不能导出不完整的报告");
+    if (sources.some((source) => source.state === "syncing"))
+      throw httpError(409, "局域网来源尚未同步完成，请先查询并稍后导出");
+    let generation = this.capture(scope);
     this.openingSnapshots += 1;
     let localSnapshot;
     let selectionBytes = 0;
@@ -520,7 +538,7 @@ export class FederatedReportStore extends EventEmitter {
           (!selectedIds || selectedIds.has(row.id)),
       );
       if (this.memoryBytes() + rows.length * 8 > this.maxBytes)
-        throw httpError(503, "双机导出缓存内存已达上限");
+        throw httpError(503, "局域网导出缓存内存已达上限");
       selectionBytes = rows.length * 8;
       this.selectionBytes += selectionBytes;
       localSnapshot = await this.local.exportSnapshot(
@@ -534,11 +552,9 @@ export class FederatedReportStore extends EventEmitter {
         settings.epoch !== this.lan.getSettings().epoch ||
         (scope &&
           (this.scopes.get(scope.key) !== scope ||
-            scope.loading ||
-            scope.warning ||
-            !this.lan.getStatus().connected))
+            this.incomplete(scope)))
       )
-        throw httpError(409, "双机报告状态已经变化，请重新查询后导出");
+        throw httpError(409, "局域网报告状态已经变化，请重新查询后导出");
       const detailCount =
         localSnapshot.detailCount +
         rows.reduce(

@@ -6,13 +6,14 @@ const props = defineProps({
   initialized: Boolean,
   message: String,
   offline: Boolean,
+  deploymentMode: String,
 });
 const emit = defineEmits(["authenticated"]);
 const form = reactive({ token: "", username: "", password: "", confirm: "" });
 const busy = ref(false);
 const error = ref("");
 onMounted(async () => {
-  if (!props.initialized && window.liziDesktop?.getSetupToken) {
+  if (props.deploymentMode !== "server" && !props.initialized && window.liziDesktop?.getSetupToken) {
     try {
       form.token = (await window.liziDesktop.getSetupToken()) || "";
     } catch {
@@ -54,9 +55,9 @@ async function submit() {
       <div class="brand-mark"><Activity :size="26" /></div>
       <p class="eyebrow">LIZI · 粒子强度</p>
       <h1>每一次测量，<br />清晰可见。</h1>
-      <p>在电脑与手机之间，随时查看同一份报告。</p>
+      <p>{{ deploymentMode === "server" ? "登录中心服务器，查看各采集设备已上传的报告。" : "本地采集与查看，按需汇总和上传报告。" }}</p>
       <div class="auth-caption">
-        <ShieldCheck :size="18" /> 账户保护 · 本地数据 · 实时同步
+        <ShieldCheck :size="18" /> 账户保护 · {{ deploymentMode === "server" ? "集中查看" : "本地数据" }} · 独立保存
       </div>
     </section>
     <section class="auth-card">
@@ -81,7 +82,7 @@ async function submit() {
             autocomplete="off"
             required
           /><span class="field-help"
-            >令牌位于服务数据目录的 setup-token.txt。本机桌面会自动读取。</span
+            >{{ deploymentMode === "server" ? "请向服务器管理员获取服务数据目录 setup-token.txt 中的设置令牌。" : "令牌位于服务数据目录的 setup-token.txt。本机桌面会自动读取。" }}</span
           ></label
         >
         <label

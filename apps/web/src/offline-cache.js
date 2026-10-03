@@ -122,6 +122,7 @@ export async function sessionScope(state) {
   if (state.authenticationEnabled && !state.user) return "";
   const identity = JSON.stringify([
     state.authenticationEnabled,
+    state.deploymentMode || "client",
     state.user?.id,
     state.user?.role,
     state.dataRoot,

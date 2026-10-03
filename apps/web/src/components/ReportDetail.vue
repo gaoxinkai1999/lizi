@@ -27,6 +27,7 @@ const fields = [
 <template>
   <p class="report-source-label">
     来源：{{ report.sourceName || report.sourceId || "本机" }}
+    <span v-if="report.instrumentId"> · 仪器：{{ report.instrumentId }}（强度仪）</span>
   </p>
   <div class="report-detail">
     <dl class="detail-grid">

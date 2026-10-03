@@ -24,6 +24,7 @@ const ready = ref(false);
 const bootError = ref("");
 const initialized = ref(true);
 const authenticationEnabled = ref(false);
+const deploymentMode = ref("client");
 const user = ref(null);
 const today = ref(localDate());
 const page = ref("reports");
@@ -74,6 +75,10 @@ function acceptRevision(value) {
   refreshKey.value++;
 }
 function acceptStatus(value) {
+  if (value.deploymentMode && value.deploymentMode !== deploymentMode.value) {
+    refreshState();
+    return;
+  }
   if (value.cacheEpoch !== undefined && dataScope.value) {
     const expectedEpoch = String(dataScope.value).match(
       /(?:^|[:.])([^:.]+)$/,
@@ -118,6 +123,7 @@ async function refreshState() {
     if (sequence !== stateSequence) return;
     const identityChanged =
       data.authenticationEnabled !== authenticationEnabled.value ||
+      (data.deploymentMode || "client") !== deploymentMode.value ||
       Boolean(user.value) !== Boolean(data.user) ||
       (user.value &&
         (data.user?.id !== user.value.id ||
@@ -140,6 +146,7 @@ async function refreshState() {
       if (sequence !== stateSequence) return;
     }
     authenticationEnabled.value = data.authenticationEnabled;
+    deploymentMode.value = data.deploymentMode || "client";
     initialized.value = data.initialized;
     today.value = data.today || localDate();
     user.value = data.user;
@@ -157,6 +164,7 @@ async function refreshState() {
         dataScope: dataScope.value,
         transientReports: transientReports.value,
         authenticationEnabled: data.authenticationEnabled,
+        deploymentMode: deploymentMode.value,
         today: today.value,
         savedAt: Date.now(),
         query: initialQuery.value,
@@ -329,6 +337,7 @@ onMounted(async () => {
     dataScope.value = cached.dataScope || "";
     transientReports.value = Boolean(cached.transientReports);
     authenticationEnabled.value = cached.authenticationEnabled;
+    deploymentMode.value = cached.deploymentMode || "client";
     today.value = cached.today || localDate();
     initialQuery.value = cached.query;
     offlineSession.value = true;
@@ -370,6 +379,7 @@ onUnmounted(() => {
   <AuthView
     v-else-if="authenticationEnabled && !user && !offlineSession"
     :initialized="initialized"
+    :deployment-mode="deploymentMode"
     :message="message"
     :offline="!verified"
     @authenticated="authenticated"
@@ -420,8 +430,8 @@ onUnmounted(() => {
             !verified
               ? "离线 / 等待验证"
               : live
-                ? "实时同步"
-                : "在线 · 同步重连中"
+                ? "实时更新"
+                : "在线 · 更新连接重连中"
           }}</span
         >
         <button
@@ -453,6 +463,7 @@ onUnmounted(() => {
           :key="scope"
           :cache-scope="scope"
           :data-root="dataRoot"
+          :deployment-mode="deploymentMode"
           :transient-reports="transientReports"
           @query-changed="initialQuery = $event"
           :initial-query="initialQuery"
@@ -467,6 +478,7 @@ onUnmounted(() => {
         <SettingsView
           v-if="page === 'settings' && verified && user"
           :user="user"
+          :deployment-mode="deploymentMode"
           :authentication-enabled="authenticationEnabled"
           :initialized="initialized"
           :status="status"

@@ -29,16 +29,16 @@ function Get-VerifiedResource($Entry, [string] $Name) {
 }
 
 $nodeArchive = Get-VerifiedResource $versions.node "node-$($versions.node.version).zip"
-$frpArchive = Get-VerifiedResource $versions.frp "frp-$($versions.frp.version).zip"
 $winSw = Get-VerifiedResource $versions.winsw "winsw-$($versions.winsw.version).exe"
 Expand-Archive -LiteralPath $nodeArchive -DestinationPath $cache -Force
-Expand-Archive -LiteralPath $frpArchive -DestinationPath $cache -Force
 $nodeDirectory = Join-Path $cache "node-v$($versions.node.version)-win-x64"
-$frpDirectory = Join-Path $cache "frp_$($versions.frp.version)_windows_amd64"
 Copy-Item -LiteralPath (Join-Path $nodeDirectory 'node.exe') -Destination (Join-Path $runtime 'node.exe') -Force
 Copy-Item -LiteralPath (Join-Path $nodeDirectory 'LICENSE') -Destination (Join-Path $runtime 'NODE-LICENSE.txt') -Force
-Copy-Item -LiteralPath (Join-Path $frpDirectory 'frpc.exe') -Destination (Join-Path $runtime 'frpc.exe') -Force
-Copy-Item -LiteralPath (Join-Path $frpDirectory 'LICENSE') -Destination (Join-Path $runtime 'FRP-LICENSE.txt') -Force
+# Older generated resources must not leak the removed tunnel into a new installer.
+foreach ($obsolete in @('frpc.exe', 'FRP-LICENSE.txt', 'trusted-frp-ca.pem')) {
+    $obsoletePath = Join-Path $runtime $obsolete
+    if (Test-Path -LiteralPath $obsoletePath) { Remove-Item -LiteralPath $obsoletePath -Force }
+}
 Copy-Item -LiteralPath $winSw -Destination (Join-Path $runtime 'LiziService.exe') -Force
 Copy-Item -LiteralPath (Join-Path $root 'apps/desktop/build/WINSW-LICENSE.txt') -Destination $runtime -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'runtime-versions.json') -Destination $runtime -Force

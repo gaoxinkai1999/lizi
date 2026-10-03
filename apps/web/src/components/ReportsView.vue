@@ -27,6 +27,7 @@ const props = defineProps({
   dataRoot: String,
   initialQuery: Object,
   scanStatus: Object,
+  deploymentMode: String,
 });
 const clientId = crypto.randomUUID();
 function requestQuery(snapshot) {
@@ -93,6 +94,7 @@ let controller,
   sequence = 0,
   pendingRefresh = false;
 const shiftNames = { day: "白班", night: "夜班", full: "完整班次" };
+const sourceStates = { local: "本机", ready: "最近在线", syncing: "待补传", offline: "离线", error: "上传异常", revoked: "已撤销", stale: "缓存已过期" };
 const timeRange = computed(
   () =>
     ({
@@ -131,7 +133,7 @@ const scanErrors = computed(() => {
 const emptyState = computed(() => {
   if (!props.online && props.transientReports)
     return {
-      title: "双机页面已断线",
+      title: "局域网汇总页面已断线",
       description:
         "当前结果只保留在内存中，连接恢复后才能继续获取报告；不会把断线状态当成零份报告。",
     };
@@ -203,7 +205,12 @@ function leasePayload(snapshot, release = false) {
   };
 }
 async function touchLease() {
-  if (!props.online || !props.active || document.visibilityState !== "visible")
+  if (
+    props.deploymentMode === "server" ||
+    !props.online ||
+    !props.active ||
+    document.visibilityState !== "visible"
+  )
     return;
   const snapshot = loadedQuery.value || query;
   if (!snapshot?.date || !snapshot?.shift) return;
@@ -223,7 +230,12 @@ async function touchLease() {
 function scheduleLease() {
   clearInterval(leaseTimer);
   leaseTimer = null;
-  if (props.online && props.active && document.visibilityState === "visible") {
+  if (
+    props.deploymentMode !== "server" &&
+    props.online &&
+    props.active &&
+    document.visibilityState === "visible"
+  ) {
     touchLease();
     leaseTimer = setInterval(touchLease, 30_000);
   }
@@ -497,7 +509,7 @@ async function* imageReports(snapshot, chosen, entire, signal) {
     else {
       if (!cacheAllowed.value)
         throw new Error(
-          "双机报告只保留在内存中，断线后不能生成离线图片；请连接主机后重试。",
+          "局域网汇总报告只保留在内存中，断线后不能生成离线图片；请连接本地服务后重试。",
         );
       const saved = await readReportPage(props.cacheScope, {
         ...params,
@@ -675,10 +687,10 @@ onUnmounted(() => {
       >
     </div>
     <p v-if="transient" class="notice" role="status">
-      双机报告仅保留在本页面内存中，断线后显示的是最后一次已获取的结果；不会写入离线缓存。
+      局域网汇总报告仅保留在本页面内存中，断线后显示的是最后一次已获取的结果；不会写入离线缓存。
     </p>
     <div v-if="sourceWarnings.length" class="error-message" role="alert">
-      <strong>报告来源存在暂时问题，数量不能视为完整：</strong>
+      <strong>数据完整性提示：</strong>
       <p v-for="warning in sourceWarnings" :key="warning">{{ warning }}</p>
     </div>
     <p v-if="sources.length" class="field-help report-sources">
@@ -686,7 +698,7 @@ onUnmounted(() => {
         >{{ index ? "、" : "" }}{{ source.name || source.id
         }}{{
           source.state && source.state !== "online"
-            ? `（${source.warning || "暂时不可用"}）`
+            ? `（${source.warning || sourceStates[source.state] || "暂时不可用"}）`
             : ""
         }}</span
       >
@@ -829,6 +841,8 @@ onUnmounted(() => {
                 >来源：{{
                   report.sourceName || report.sourceId || "本机"
                 }}</span
+              ><span v-if="report.instrumentId" class="badge source-badge"
+                >仪器：{{ report.instrumentId }}</span
               ><span
                 v-if="report.line !== null && report.line !== undefined"
                 class="line-badge"
@@ -884,7 +898,7 @@ onUnmounted(() => {
                 <th>时间</th>
                 <th>产线</th>
                 <th>样品</th>
-                <th>来源</th>
+                <th>来源 / 仪器</th>
                 <th class="average-column">平均 / g</th>
                 <th>最大 / g</th>
                 <th>最小 / g</th>
@@ -918,7 +932,7 @@ onUnmounted(() => {
                     title="总分析"
                   />{{ report.sampleName }}
                 </td>
-                <td>{{ report.sourceName || report.sourceId || "本机" }}</td>
+                <td>{{ report.sourceName || report.sourceId || "本机" }}<span v-if="report.instrumentId"> · {{ report.instrumentId }}</span></td>
                 <td class="average-column">
                   {{ showValue(report.averageHardness) }}
                 </td>
@@ -958,6 +972,7 @@ onUnmounted(() => {
                   {{ report.sampleName }} · 来源：{{
                     report.sourceName || report.sourceId || "本机"
                   }}
+                  <span v-if="report.instrumentId"> · 仪器：{{ report.instrumentId }}</span>
                 </p>
                 <time>{{ report.date }} {{ report.time }}</time>
               </div>

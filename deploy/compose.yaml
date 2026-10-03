@@ -1,0 +1,32 @@
+name: lizi-server
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: lizi-server:3.0.0
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:${LIZI_HTTP_PORT:-13211}:3210"
+    volumes:
+      - reports:/data
+    environment:
+      TZ: Asia/Shanghai
+      # The only published ingress is host loopback, behind exactly one HTTPS proxy.
+      LIZI_TRUST_PROXY: "1"
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  reports:

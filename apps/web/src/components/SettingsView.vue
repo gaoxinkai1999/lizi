@@ -1,35 +1,38 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   FolderOpen,
   RefreshCw,
   ChevronRight,
   ArrowUp,
-  ExternalLink,
-  Copy,
-  Power,
-  Globe,
   Server,
-  Radio,
   ShieldCheck,
 } from "lucide-vue-next";
-import QRCode from "qrcode";
 import { request } from "../api.js";
 import Modal from "./Modal.vue";
 import LanSettings from "./LanSettings.vue";
+import CloudSettings from "./CloudSettings.vue";
 const props = defineProps({
   user: Object,
   status: Object,
   statusError: String,
   authenticationEnabled: Boolean,
   initialized: Boolean,
+  deploymentMode: String,
 });
 const emit = defineEmits([
   "refresh-status",
   "reports-changed",
   "access-changed",
 ]);
-const admin = computed(() => props.user.role === "admin");
+const admin = computed(() => props.user?.role === "admin");
+const server = computed(() => props.deploymentMode === "server");
+const accessDescription = computed(() => {
+  if (server.value) return "中心服务器必须登录，账户与权限在账户页管理。";
+  return props.authenticationEnabled
+    ? "使用账户登录后访问，账户与权限在账户页管理。"
+    : "打开链接即可查看报告；局域网配对、目录和上传配置仅限本机管理。";
+});
 const settings = ref(null);
 const loading = ref(false);
 const loadError = ref("");
@@ -38,69 +41,18 @@ const success = ref("");
 const busy = ref("");
 const accessOpen = ref(false);
 const dataPath = ref("");
-const remote = reactive({
-  enabled: false,
-  url: "",
-  serverAddr: "",
-  serverPort: 7000,
-  remotePort: 18080,
-  token: "",
-});
 const directoryOpen = ref(false);
 const directory = ref(null);
 const directoryPath = ref("");
 const directoryBusy = ref(false);
 const directoryError = ref("");
-const qr = ref("");
-const qrError = ref("");
-let directoryController,
-  directorySequence = 0,
-  qrSequence = 0;
-const remoteUrl = computed(() => {
-  try {
-    const url = new URL(props.status?.remote?.url || "");
-    return url.protocol === "https:" && !url.username && !url.password
-      ? url.href
-      : "";
-  } catch {
-    return "";
-  }
-});
-watch(
-  remoteUrl,
-  async (url) => {
-    const sequence = ++qrSequence;
-    qr.value = "";
-    qrError.value = "";
-    if (!url) return;
-    try {
-      const image = await QRCode.toDataURL(url, {
-        width: 208,
-        margin: 2,
-        color: { dark: "#1c3545", light: "#ffffff" },
-      });
-      if (sequence === qrSequence) qr.value = image;
-    } catch {
-      if (sequence === qrSequence)
-        qrError.value = "二维码生成失败，您仍可复制访问地址。";
-    }
-  },
-  { immediate: true },
-);
+let directoryController, directorySequence = 0;
 function applySettings(value) {
   settings.value = value;
-  dataPath.value = value.dataPath;
-  Object.assign(remote, {
-    enabled: value.remote.enabled,
-    url: value.remote.url,
-    serverAddr: value.remote.serverAddr,
-    serverPort: value.remote.serverPort,
-    remotePort: value.remote.remotePort,
-    token: "",
-  });
+  dataPath.value = value.dataPath || "";
 }
 async function loadSettings() {
-  if (!admin.value) return;
+  if (!admin.value || server.value) return;
   loading.value = true;
   loadError.value = "";
   try {
@@ -191,46 +143,6 @@ async function browse(path = "") {
     if (sequence === directorySequence) directoryBusy.value = false;
   }
 }
-async function saveRemote(enabled) {
-  busy.value = "remote";
-  error.value = "";
-  success.value = "";
-  const source = enabled ? remote : settings.value.remote;
-  const body = {
-    enabled,
-    url: source.url.trim(),
-    serverAddr: source.serverAddr.trim(),
-    serverPort: Number(source.serverPort),
-    remotePort: Number(source.remotePort),
-  };
-  if (enabled && remote.token) body.token = remote.token;
-  try {
-    await request("/remote", { method: "PUT", body, localAdmin: true });
-    remote.token = "";
-    await loadSettings();
-    success.value = enabled
-      ? "远程配置已保存，实际连接情况见服务状态。"
-      : "远程访问已停止。";
-    emit("refresh-status");
-  } catch (cause) {
-    error.value = cause.message;
-    emit("refresh-status");
-  } finally {
-    busy.value = "";
-  }
-}
-async function copyUrl() {
-  error.value = "";
-  success.value = "";
-  try {
-    if (!navigator.clipboard?.writeText)
-      throw new Error("浏览器不支持自动复制，请长按访问地址复制。");
-    await navigator.clipboard.writeText(remoteUrl.value);
-    success.value = "访问地址已复制。";
-  } catch (cause) {
-    error.value = cause.message;
-  }
-}
 function formatTime(value) {
   return value ? new Date(value).toLocaleString("zh-CN") : "尚未扫描";
 }
@@ -242,7 +154,6 @@ onMounted(loadSettings);
 onUnmounted(() => {
   directorySequence++;
   directoryController?.abort();
-  qrSequence++;
 });
 </script>
 
@@ -255,8 +166,8 @@ onUnmounted(() => {
         <p class="muted">
           {{
             admin
-              ? "管理报告来源与远程访问。"
-              : "查看数据服务与远程连接的实际状态。"
+              ? "管理报告来源与中心服务器同步。"
+              : "查看数据服务与上传连接的实际状态。"
           }}
         </p>
       </div>
@@ -283,13 +194,9 @@ onUnmounted(() => {
         </div>
       </div>
       <p class="muted">
-        {{
-          authenticationEnabled
-            ? "使用账户登录后访问，账户与权限在账户页管理。"
-            : "打开链接即可查看报告；局域网配对、目录和远程配置仅限本机粒子桌面。"
-        }}
+        {{ accessDescription }}
       </p>
-      <button :disabled="!!busy" @click="accessOpen = true">
+      <button v-if="!server" :disabled="!!busy" @click="accessOpen = true">
         {{ authenticationEnabled ? "关闭鉴权" : "启用鉴权" }}
       </button>
     </section>
@@ -298,10 +205,7 @@ onUnmounted(() => {
         <Server :size="21" />
         <div>
           <h2>服务状态</h2>
-          <p>
-            仅准备所选日期（跨夜含次日），进度实时推送；可见时每 30
-            秒补充更新状态。
-          </p>
+          <p>{{ server ? "显示中心服务器已收到的数据；客户端离线或积压时，报告可能不完整。" : "本地查询按所选日期准备数据；开启上传后会在后台独立采集与补传。" }}</p>
         </div>
       </div>
       <p v-if="statusError" class="error-message" role="alert">
@@ -312,7 +216,7 @@ onUnmounted(() => {
       </p>
       <template v-else
         ><dl class="status-grid">
-          <div>
+          <div v-if="!server">
             <dt>目录监控</dt>
             <dd>
               <span class="status-dot" :class="{ good: status.watching }" />{{
@@ -321,14 +225,14 @@ onUnmounted(() => {
             </dd>
           </div>
           <div>
-            <dt>报告缓存</dt>
+            <dt>{{ server ? "已接收报告" : "本地报告" }}</dt>
             <dd>{{ status.reportCount }} 份</dd>
           </div>
-          <div>
+          <div v-if="!server">
             <dt>扫描状态</dt>
             <dd>{{ status.scanning ? "正在扫描" : "空闲" }}</dd>
           </div>
-          <div v-if="status.scanProgress">
+          <div v-if="!server && status.scanProgress">
             <dt>当前日期扫描进度</dt>
             <dd>
               已检查 {{ status.scanProgress.visited }} 个 · 已入库
@@ -336,7 +240,7 @@ onUnmounted(() => {
               {{ status.scanProgress.invalid }} 个
             </dd>
           </div>
-          <div>
+          <div v-if="!server">
             <dt>最近扫描</dt>
             <dd>{{ formatTime(status.lastScan) }}</dd>
           </div>
@@ -359,7 +263,7 @@ onUnmounted(() => {
             <dd>{{ status.revision }}</dd>
           </div>
         </dl>
-        <details v-if="status.errors?.length" class="scan-errors">
+        <details v-if="!server && status.errors?.length" class="scan-errors">
           <summary>{{ status.errors.length }} 个扫描问题</summary>
           <ul>
             <li v-for="(item, index) in status.errors" :key="index">
@@ -370,8 +274,9 @@ onUnmounted(() => {
         </details></template
       >
     </section>
-    <LanSettings v-if="props.user" />
-    <template v-if="admin"
+    <CloudSettings :deployment-mode="deploymentMode" :user="user" :sync-status="status?.sync" />
+    <LanSettings v-if="!server && props.user" />
+    <template v-if="admin && !server"
       ><p v-if="loading && !settings" class="notice">正在读取配置…</p>
       <div v-if="loadError" class="error-message" role="alert">
         {{ loadError }} <button @click="loadSettings">重新读取设置</button>
@@ -384,7 +289,7 @@ onUnmounted(() => {
               <h2>报告目录</h2>
               <p>
                 请选择包含 YYYY-MM-DD
-                日期子目录的根目录，不是某一天的目录。只按查询日期读取（夜班/全天含次日），不会默认遍历所有历史；原始文件不会被修改或删除。
+                日期子目录的根目录，不是某一天的目录。查询按日期读取，上传会在后台采集与补传；原始文件不会被修改或删除。
               </p>
             </div>
           </div>
@@ -431,150 +336,17 @@ onUnmounted(() => {
             </div>
           </form>
         </section>
-        <section class="settings-section">
-          <div class="section-heading">
-            <Globe :size="21" />
-            <div>
-              <h2>远程访问</h2>
-              <p>通过 HTTPS 地址，从手机访问同一套报告。</p>
-            </div>
-          </div>
-          <form class="form-stack" @submit.prevent="saveRemote(true)">
-            <div class="form-columns">
-              <label class="full-width"
-                >公网 HTTPS 地址<input
-                  v-model="remote.url"
-                  type="url"
-                  pattern="https://.*"
-                  required
-                  placeholder="https://reports.example.com" /></label
-              ><label
-                >FRP 服务器地址<input
-                  v-model="remote.serverAddr"
-                  required
-                  placeholder="frp.example.com" /></label
-              ><label
-                >服务器端口<input
-                  v-model="remote.serverPort"
-                  type="number"
-                  min="1"
-                  max="65535"
-                  required /></label
-              ><label
-                >远程映射端口<input
-                  v-model="remote.remotePort"
-                  type="number"
-                  min="1"
-                  max="65535"
-                  required /></label
-              ><label
-                >连接令牌<input
-                  v-model="remote.token"
-                  type="password"
-                  autocomplete="new-password"
-                  :placeholder="
-                    settings.remote.tokenConfigured
-                      ? '已配置，留空保留'
-                      : '输入 FRP 连接令牌'
-                  "
-                  :required="!settings.remote.tokenConfigured"
-              /></label>
-            </div>
-            <p class="field-help">
-              需先在服务器配置 FRP 与 HTTPS
-              反向代理。令牌只保存在服务本机，不会返回到页面。
-            </p>
-            <div class="button-row">
-              <button class="primary" :disabled="!!busy">
-                {{
-                  busy === "remote"
-                    ? "正在应用…"
-                    : remote.enabled
-                      ? "保存远程配置"
-                      : "保存并启用"
-                }}</button
-              ><button
-                type="button"
-                :disabled="!!busy || !settings.remote.enabled"
-                @click="saveRemote(false)"
-              >
-                <Power :size="17" />停止远程访问
-              </button>
-            </div>
-          </form>
-        </section></template
+        </template
       ></template
     >
-    <section class="settings-section">
-      <div class="section-heading">
-        <Radio :size="21" />
-        <div>
-          <h2>连接与分享</h2>
-          <p>
-            {{
-              status?.remote?.enabled
-                ? "启用不代表连接成功，请以实际状态为准。"
-                : "远程访问尚未启用。"
-            }}
-          </p>
-        </div>
-      </div>
-      <p class="remote-state">
-        <span
-          class="status-dot"
-          :class="{ good: status?.remote?.connected }"
-        />{{
-          !status
-            ? "状态未知"
-            : status.remote?.connected
-              ? "远程已连接"
-              : status.remote?.enabled
-                ? "尚未连接"
-                : "已关闭"
-        }}
-      </p>
-      <p v-if="status?.remote?.lastError" class="error-message">
-        {{ status.remote.lastError }}
-      </p>
-      <div v-if="remoteUrl" class="remote-share">
-        <img
-          v-if="qr"
-          :src="qr"
-          alt="手机访问地址二维码"
-          width="208"
-          height="208"
-        />
-        <div>
-          <p class="muted">
-            {{
-              authenticationEnabled
-                ? "手机扫码打开，然后使用您的账户登录。"
-                : "手机扫码或打开链接即可使用，无需登录。"
-            }}
-          </p>
-          <a
-            class="remote-link"
-            :href="remoteUrl"
-            target="_blank"
-            rel="noopener noreferrer"
-            >{{ remoteUrl }}<ExternalLink :size="16"
-          /></a>
-          <p v-if="qrError" class="error-message">{{ qrError }}</p>
-          <button @click="copyUrl"><Copy :size="17" />复制地址</button>
-          <p v-if="!status?.remote?.connected" class="field-help">
-            当前未确认连通，该地址可能暂时无法访问。
-          </p>
-        </div>
-      </div>
-    </section>
     <Modal
-      v-if="accessOpen"
+      v-if="!server && accessOpen"
       :title="authenticationEnabled ? '关闭访问鉴权？' : '启用访问鉴权？'"
       @close="accessOpen = false"
     >
       <p v-if="authenticationEnabled" class="muted">
-        关闭后，任何能访问此地址的人都可查看报告、浏览目录和修改配置。
-        公网地址也会完全开放。已有账户会保留，所有客户端立即切换为公开访问。
+        关闭后，任何能访问此地址的人都可查看报告。本机管理限制仍然生效。
+        已有账户会保留，所有客户端立即切换为公开访问。
       </p>
       <template v-else>
         <p class="muted">启用后，所有客户端都需要登录才能继续使用。</p>
@@ -594,7 +366,7 @@ onUnmounted(() => {
       </template>
     </Modal>
     <Modal
-      v-if="directoryOpen"
+      v-if="!server && directoryOpen"
       title="选择报告目录"
       @close="directoryOpen = false"
       ><p class="muted">浏览的是服务电脑上的目录，不是当前手机的文件。</p>

@@ -79,7 +79,7 @@ test("LAN configuration remains local-only even when the report site is public",
   assert.equal(local.canManage, false);
   assert.deepEqual(local.addresses, []);
   assert.deepEqual(local.discovered, []);
-  assert.equal(local.peer, null);
+  assert.deepEqual(local.peers, []);
   const managed = await (
     await request("/api/lan", {
       headers: {

@@ -19,7 +19,7 @@ async function stableWrite(file, content) {
   await fs.utimes(file, older, older);
 }
 
-async function fixture(t) {
+async function fixture(t, { selectRoot = true } = {}) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "lizi-reports-"));
   const root = path.join(home, "reports");
   const other = path.join(home, "other");
@@ -37,7 +37,7 @@ async function fixture(t) {
     await fs.rm(home, { recursive: true, force: true });
   });
   await store.start();
-  await store.setRoot(root);
+  if (selectRoot) await store.setRoot(root);
   return { home, root, other, policy, db, store };
 }
 
@@ -69,8 +69,8 @@ async function collect(snapshot) {
   return reports;
 }
 
-test("startup/root selection never indexes history; date queries expose bounded batches and pagination", async (t) => {
-  const { root, store } = await fixture(t);
+test("initial historical directories stay opt-in; date queries preserve exclusions and pagination", async (t) => {
+  const { root, store } = await fixture(t, { selectRoot: false });
   for (let index = 0; index < 160; index += 1) {
     await stableWrite(
       path.join(root, query.date, "instrument", `${index}.txt`),
@@ -99,15 +99,9 @@ test("startup/root selection never indexes history; date queries expose bounded 
   assert.equal(
     store.status().reportCount,
     0,
-    "unrequested dates and loose files must never be traversed",
+    "initial historical directories remain opt-in",
   );
-  const counts = [];
-  store.on("status", (status) => {
-    if (status.scanning) counts.push(status.reportCount);
-  });
-  const initial = await store.query({ ...query, pageSize: 25 });
-  assert.equal(initial.indexing, true);
-  assert.equal(initial.total, 0);
+  await store.query({ ...query, pageSize: 25 });
   await store.scan();
   const first = await store.query({ ...query, pageSize: 25 });
   const second = await store.query({ ...query, page: 2, pageSize: 25 });
@@ -116,10 +110,6 @@ test("startup/root selection never indexes history; date queries expose bounded 
   assert.equal(first.reports[0].sampleName, "159 A");
   assert.equal(first.reports[0].averageHardness, 0);
   assert.equal(second.reports[0].sampleName, "134 A");
-  assert.ok(
-    counts.some((count) => count > 0 && count < 160),
-    "committed pages become visible before the date finishes",
-  );
   assert.equal(store.status().reportCount, 160);
   const absent = await settled(store, { ...query, date: "2011-01-01" });
   assert.equal(
@@ -132,7 +122,7 @@ test("startup/root selection never indexes history; date queries expose bounded 
   });
 });
 
-test("unchanged invalid fingerprints are persisted and never re-parsed; watcher updates/deletes only active dates", async (t) => {
+test("invalid report errors survive background scans until fixed or deleted", async (t) => {
   const { root, store } = await fixture(t);
   const folder = path.join(root, query.date, "instrument");
   const file = path.join(folder, "a.txt");
@@ -147,7 +137,6 @@ test("unchanged invalid fingerprints are persisted and never re-parsed; watcher 
   const revision = store.revision;
   await store.scan();
   assert.equal(store.revision, revision);
-  assert.equal(store.status().scanProgress.parsed, 0);
   const updated = nextStatus(
     store,
     (status) => !status.scanning && status.revision > revision,
@@ -164,8 +153,8 @@ test("unchanged invalid fingerprints are persisted and never re-parsed; watcher 
   assert.equal((await store.query(query)).total, 0);
 });
 
-test("parser upgrade retries previously rejected reports only in requested dates", async (t) => {
-  const { root, store, db } = await fixture(t);
+test("parser upgrade retries persisted invalid fingerprints without losing optional values", async (t) => {
+  const { root, store, db } = await fixture(t, { selectRoot: false });
   const file = path.join(root, query.date, "instrument", "legacy.txt");
   await stableWrite(
     file,
@@ -186,6 +175,7 @@ test("parser upgrade retries previously rejected reports only in requested dates
     historical,
     "Date 2010-01-01_08-00-00\nSample Name 1 history\n",
   );
+  await store.setRoot(root);
   assert.equal(store.status().reportCount, 0);
   const result = await settled(store);
   assert.equal(result.total, 1);
@@ -193,9 +183,7 @@ test("parser upgrade retries previously rejected reports only in requested dates
   assert.equal(result.reports[0].averageHardness, 125);
   assert.equal(result.reports[0].step, null);
   assert.equal(store.status().reportCount, 1);
-  assert.deepEqual(store.status().activeDates, [query.date]);
   await store.scan();
-  assert.equal(store.status().scanProgress.parsed, 0);
 });
 
 test("night/full activate two date directories and preserve aggregate export selection and repeatable snapshots", async (t) => {
