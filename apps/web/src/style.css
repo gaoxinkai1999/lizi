@@ -2105,6 +2105,183 @@ td:last-child {
     font-size: 12px;
   }
 }
+.reports-page--table-first {
+  min-width: 0;
+  max-width: 100%;
+}
+.reports-page--table-first > * {
+  min-width: 0;
+}
+.reports-page--table-first .query-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border-radius: 9px;
+}
+.reports-page--table-first .date-field {
+  width: auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.reports-page--table-first .date-field input {
+  width: 156px;
+  min-height: 36px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.reports-page--table-first .shift-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.reports-page--table-first .query-panel .field-label {
+  margin: 0;
+}
+.reports-page--table-first .segmented {
+  padding: 2px;
+  gap: 2px;
+}
+.reports-page--table-first .segmented button {
+  min-width: 52px;
+  min-height: 32px;
+  padding: 5px 10px;
+}
+.reports-page--table-first .query-refresh {
+  min-height: 36px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.reports-page--table-first .results-toolbar {
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-bottom: 6px;
+}
+.reports-page--table-first .result-count {
+  flex-direction: row;
+  align-items: center;
+  gap: 5px 10px;
+}
+.reports-page--table-first .result-count strong {
+  font-size: 14px;
+}
+.reports-page--table-first .results-toolbar button,
+.reports-page--table-first .pagination button,
+.reports-page--table-first .report-options-content button {
+  min-height: 34px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.reports-page--table-first .report-options {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #637387;
+}
+.reports-page--table-first .report-options > summary {
+  width: fit-content;
+  max-width: 100%;
+  padding: 7px 2px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.reports-page--table-first .report-options-content {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+.reports-page--table-first .report-options-content > * {
+  min-width: 0;
+  margin: 0;
+}
+.reports-page--table-first .report-options-content .check-label {
+  min-height: 34px;
+}
+.reports-page--table-first .report-alert-summary {
+  margin: 6px 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  border: 1px solid #f0d4ce;
+  border-radius: 9px;
+  background: #fff1ee;
+  color: #9b4139;
+}
+.reports-page--table-first .report-alert-summary > summary {
+  cursor: pointer;
+}
+.reports-page--table-first .selection-tools {
+  margin: 0;
+}
+.reports-page--table-first .full-table {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-height: max(280px, calc(100dvh - 260px));
+  border-radius: 9px;
+}
+.reports-page--table-first .pagination {
+  gap: 6px;
+  margin: 8px 0;
+}
+@media (max-width: 700px) {
+  .reports-page--table-first .query-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 44px;
+    gap: 6px 8px;
+    padding: 8px;
+  }
+  .reports-page--table-first .date-field {
+    grid-column: 1;
+    grid-row: 1;
+    font-size: 12px;
+  }
+  .reports-page--table-first .date-field input {
+    flex: 1;
+    width: 0;
+    height: 44px;
+    font-size: 16px;
+  }
+  .reports-page--table-first .shift-field {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  .reports-page--table-first .segmented button {
+    min-width: 0;
+    min-height: 40px;
+  }
+  .reports-page--table-first .query-refresh {
+    grid-column: 2;
+    grid-row: 1;
+    min-height: 44px;
+    margin: 0;
+  }
+  .reports-page--table-first .results-toolbar button,
+  .reports-page--table-first .pagination button,
+  .reports-page--table-first .report-options-content button,
+  .reports-page--table-first .report-options-content .check-label {
+    min-height: 44px;
+  }
+  .reports-page--table-first .report-options > summary {
+    min-height: 44px;
+    padding: 12px 2px;
+  }
+  .reports-page--table-first .full-table {
+    max-height: max(240px, calc(100dvh - 340px));
+  }
+  .reports-page--table-first .pagination span {
+    flex: 1;
+    min-width: 0;
+    text-align: center;
+    font-size: 11px;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

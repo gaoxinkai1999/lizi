@@ -3,13 +3,9 @@ import { computed, onUnmounted, reactive, ref, watch } from "vue";
 import {
   ArrowDownToLine,
   RefreshCw,
-  SlidersHorizontal,
   Image,
   ClipboardCopy,
-  Check,
-  ChevronRight,
   FileSearch,
-  X,
 } from "lucide-vue-next";
 import { localDate, request, saveBlob, showValue } from "../api.js";
 import { readReportPage, saveReportPage, pageKey } from "../offline-cache.js";
@@ -63,18 +59,6 @@ const cacheAllowed = computed(
 const actionError = ref("");
 const notice = ref("");
 const cached = ref(false);
-const mode = ref("auto");
-const mobileViewport = window.matchMedia("(max-width: 700px)");
-const isMobile = ref(mobileViewport.matches);
-const effectiveMode = computed(() =>
-  mode.value === "auto" ? (isMobile.value ? "cards" : "table") : mode.value,
-);
-const openDetails = ref(new Set());
-function updateViewport(event) {
-  isMobile.value = event.matches;
-}
-mobileViewport.addEventListener("change", updateViewport);
-const optionsOpen = ref(false);
 const detail = ref(null);
 const actionBusy = ref("");
 const actionProgress = ref("");
@@ -157,11 +141,6 @@ const emptyState = computed(() => {
     description: "试试其他日期或班次。新报告到达后会自动更新。",
   };
 });
-const simpleReports = computed(() =>
-  selected.value.size && !wholeQuery.value
-    ? reports.value.filter((report) => selected.value.has(report.id))
-    : reports.value,
-);
 function isSelected(id) {
   return wholeQuery.value || selected.value.has(id);
 }
@@ -269,7 +248,6 @@ async function loadReports() {
     controller?.abort();
     reports.value = [];
     loadedQuery.value = null;
-    openDetails.value = new Set();
     detail.value = null;
     loadedAt.value = "";
     transient.value = Boolean(props.transientReports);
@@ -594,24 +572,14 @@ onUnmounted(() => {
   exportController?.abort();
   releaseLease();
   releaseImages();
-  mobileViewport.removeEventListener("change", updateViewport);
   document.removeEventListener("visibilitychange", resume);
   window.removeEventListener("pagehide", releaseLease);
 });
 </script>
 
 <template>
-  <section class="reports-page">
-    <div class="page-heading">
-      <div>
-        <p class="eyebrow">REPORTS</p>
-        <h1>强度报告</h1>
-        <p class="muted heading-description">从每一粒样品，了解生产质量。</p>
-      </div>
-      <button class="subtle yesterday-button" @click="yesterday">
-        昨日完整<ChevronRight :size="17" />
-      </button>
-    </div>
+  <section class="reports-page reports-page--table-first">
+    <h1 class="sr-only">强度报告</h1>
     <section class="query-panel" aria-label="报告筛选">
       <label class="date-field"
         >报告日期<input v-model="query.date" type="date" required
@@ -641,108 +609,97 @@ onUnmounted(() => {
         }}</span>
       </button>
     </section>
-    <div class="query-caption">
-      <span
-        >{{ timeRange
-        }}<span v-if="query.excludeAggregate">
-          · 已排除总分析 · 按产线排序</span
-        ></span
-      ><button
-        class="text-button"
-        :aria-expanded="optionsOpen"
-        @click="optionsOpen = !optionsOpen"
-      >
-        <SlidersHorizontal :size="16" />更多选项
-      </button>
-    </div>
-    <section v-if="optionsOpen" class="options-panel">
-      <label class="check-label"
-        ><input
-          v-model="query.excludeAggregate"
-          type="checkbox"
-        />查询时排除总分析</label
-      >
-      <p class="field-help">
-        导出全部和生成全部图片默认不含名称带“总”或“z”的总分析。若需包含，请关闭查询排除选项，全选后使用“导出选中”或“图片”。选中项始终全部保留。
-      </p>
-    </section>
     <div class="results-toolbar">
       <div class="result-count">
         <strong>{{
           loadedQuery ? `${total} 份报告` : loading ? "查询中…" : "报告查询"
         }}</strong
-        ><span v-if="loadedAt" class="muted"
-          >{{ cached || !online ? "缓存于" : "更新于" }} {{ loadedAt
-          }}{{ loading ? " · 后台更新中…" : "" }}</span
-        >
+        ><span class="muted">
+          {{ hasSelection ? `已选 ${selectionCount} 份 · ` : "" }}{{ timeRange }}
+          {{ query.excludeAggregate ? " · 已排除总分析" : "" }}
+          <template v-if="loading"> · 更新中…</template>
+          <template v-else-if="cached"> · 缓存</template>
+        </span>
       </div>
-      <label class="view-select"
-        ><span class="sr-only">报告显示方式</span
-        ><select v-model="mode">
-          <option value="auto">自适应视图</option>
-          <option value="cards">摘要卡片</option>
-          <option value="table">完整表格</option>
-          <option value="simple">简易模式</option>
-        </select></label
+      <button
+        class="primary"
+        :disabled="!online || !readyForActions || !!actionBusy"
+        @click="exportReports(hasSelection)"
       >
+        <ArrowDownToLine :size="18" />
+        <template v-if="actionBusy === 'export'">正在导出…</template>
+        <template v-else>{{ hasSelection ? "导出选中 Excel" : "导出全部 Excel" }}</template>
+      </button>
     </div>
-    <p v-if="transient" class="notice" role="status">
-      局域网汇总报告仅保留在本页面内存中，断线后显示的是最后一次已获取的结果；不会写入离线缓存。
+    <details class="report-options">
+      <summary>更多操作与信息</summary>
+      <div class="report-options-content">
+        <div class="button-row">
+          <button :disabled="!readyForActions || !!actionBusy" @click="generateImages">
+            <Image :size="17" />
+            <template v-if="actionBusy === 'image'">正在生成…</template>
+            <template v-else>{{ hasSelection ? "生成选中图片" : "生成全部图片" }}</template>
+          </button>
+          <button @click="yesterday">昨日完整报告</button>
+          <button :disabled="!reports.length || wholeQuery" @click="chooseWholeQuery">
+            选择整个班次（{{ total }} 份）
+          </button>
+          <button :disabled="!hasSelection" @click="clearSelection">清除选择</button>
+        </div>
+        <label class="check-label">
+          <input v-model="query.excludeAggregate" type="checkbox" />查询时排除总分析
+        </label>
+        <p class="field-help">
+          逐项与本页选择会跨页保留。选择整个班次后，如需逐项调整，请先清除选择。
+          导出全部和生成全部图片默认不含名称带“总”或“z”的总分析。若需包含，请关闭查询排除选项，再选择整个班次或逐项选择；选中项始终全部保留。排除总分析时按产线排序。
+        </p>
+        <p v-if="loadedAt" class="field-help">
+          {{ cached || !online ? "缓存于" : "更新于" }} {{ loadedAt }}
+        </p>
+        <p v-if="transient" class="field-help">
+          局域网汇总报告仅保留在本页面内存中，断线后显示的是最后一次已获取的结果；不会写入离线缓存。
+        </p>
+        <p v-if="sources.length" class="field-help report-sources">
+          来源：<span v-for="(source, index) in sources" :key="source.id"
+            >{{ index ? "、" : "" }}{{ source.name || source.id
+            }}{{ source.state && source.state !== "online" ? `（${source.warning || sourceStates[source.state] || "暂时不可用"}）` : "" }}</span>
+        </p>
+        <p v-if="online && scanStatus?.scanProgress" class="field-help">
+          已检查 {{ scanStatus.scanProgress.visited }} 个文件 · 已入库
+          {{ scanStatus.scanProgress.indexed }} 份 · 无效 {{ scanStatus.scanProgress.invalid }} 个
+        </p>
+        <p v-if="online && deploymentMode !== 'server'" class="field-help">
+          报告根目录：{{ dataRoot || "尚未设置，请先在设置中选择报告根目录" }}
+          <template v-if="queryDirectories.length">
+            <br />查找日期目录：{{ queryDirectories.join("、") }}
+          </template>
+        </p>
+      </div>
+    </details>
+    <details v-if="sourceWarnings.length" class="report-alert-summary">
+      <summary>{{ deploymentMode === "server" ? "仅含已上传数据，完整性未确认" : "来源数据可能不完整" }} · {{ sourceWarnings.length }} 项提示</summary>
+      <div role="note">
+        <p v-for="warning in sourceWarnings" :key="warning">{{ warning }}</p>
+      </div>
+    </details>
+    <p v-if="online && (indexing || scanStatus?.scanning)" class="notice" role="status">
+      数据准备中，当前结果可能不完整。
     </p>
-    <div v-if="sourceWarnings.length" class="error-message" role="alert">
-      <strong>数据完整性提示：</strong>
-      <p v-for="warning in sourceWarnings" :key="warning">{{ warning }}</p>
-    </div>
-    <p v-if="sources.length" class="field-help report-sources">
-      来源：<span v-for="(source, index) in sources" :key="source.id"
-        >{{ index ? "、" : "" }}{{ source.name || source.id
-        }}{{
-          source.state && source.state !== "online"
-            ? `（${source.warning || sourceStates[source.state] || "暂时不可用"}）`
-            : ""
-        }}</span
-      >
-    </p>
-    <p
-      v-if="online && (indexing || scanStatus?.scanning)"
-      class="notice"
-      role="status"
-    >
-      正在准备所选日期数据，可先查看已入库报告。
-      <template v-if="scanStatus?.scanProgress"
-        >已检查 {{ scanStatus.scanProgress.visited }} 个文件 · 已入库
-        {{ scanStatus.scanProgress.indexed }} 份 · 无效
-        {{ scanStatus.scanProgress.invalid }} 个</template
-      >
-    </p>
-    <div v-if="online && scanErrors.length" class="error-message" role="alert">
-      <strong
-        >所选日期有文件或目录未能读取，不能将当前数量视为完整结果。</strong
-      >
+    <details v-if="online && scanErrors.length" class="report-alert-summary">
+      <summary>部分文件或目录读取失败，当前结果可能不完整</summary>
       <p v-for="item in scanErrors" :key="item.path + item.message">
         {{ item.path }}：{{ item.message }}
       </p>
-    </div>
-    <p v-if="!online" class="notice">
-      离线报告仅供查看；Excel 导出需联网。图片仅在所需查询页均已缓存时可生成。
+    </details>
+    <p v-if="!online" class="notice" role="status">
+      {{ transientReports || transient ? "已断线，仅显示最后获取的结果；导出和图片需重新连接。" : "离线查看缓存，Excel 需联网；图片需所需查询页均已缓存。" }}
     </p>
     <p v-if="!online && indexing" class="notice">
-      此缓存保存时日期数据尚未准备完成，可能不完整；完整导出和图片需联网完成准备后再操作。
+      缓存数据尚未准备完成，可能不完整；请联网完成准备后再导出或生成图片。
     </p>
     <p v-if="error && reports.length" role="alert" class="error-message">
       更新未完成：{{ error }}。下方保留上次报告。
     </p>
-    <div
-      v-if="loadedQuery || query.page > 1"
-      class="pagination"
-      aria-label="报告分页"
-    >
-      <button :disabled="query.page <= 1" @click="query.page--">上一页</button>
-      <span>第 {{ query.page }} / {{ pageCount }} 页 · 每页最多 100 份</span>
-      <button :disabled="query.page >= pageCount" @click="query.page++">
-        下一页
-      </button>
-    </div>
     <div
       v-if="error && !reports.length"
       role="alert"
@@ -766,126 +723,14 @@ onUnmounted(() => {
       <FileSearch :size="38" />
       <h2>{{ emptyState.title }}</h2>
       <p>{{ emptyState.description }}</p>
-      <p v-if="online" class="field-help">
-        报告根目录：{{ dataRoot || "尚未设置，请先在设置中选择报告根目录" }}
-        <template v-if="queryDirectories.length">
-          <br />查找日期目录：{{ queryDirectories.join("、") }}
-        </template>
+      <p v-if="online && deploymentMode !== 'server' && !dataRoot" class="field-help">
+        请先在设置中选择报告根目录。
       </p>
       <button @click="yesterday">查看昨日完整报告</button>
     </div>
     <template v-else>
-      <div class="selection-tools">
-        <label class="check-label"
-          ><input
-            type="checkbox"
-            :checked="allSelected"
-            :indeterminate="
-              !wholeQuery &&
-              reports.some((report) => selected.has(report.id)) &&
-              !allSelected
-            "
-            @change="toggleAll"
-          />{{
-            wholeQuery
-              ? "取消整个班次选择"
-              : allSelected
-                ? "取消本页"
-                : "选择本页"
-          }}</label
-        ><button @click="chooseWholeQuery" :disabled="wholeQuery">
-          选择整个班次（{{ total }} 份）
-        </button>
-        <span class="muted"
-          >{{
-            hasSelection
-              ? `已跨页选择 ${selectionCount} 份`
-              : "逐项或本页选择会跨页保留"
-          }}{{
-            wholeQuery ? " · 如需逐项调整，请先取消整个班次选择" : ""
-          }}</span
-        >
-      </div>
-      <div
-        class="report-results"
-        :class="[
-          `view-${effectiveMode}`,
-          { 'is-loading': loading && !reports.length },
-        ]"
-        :aria-busy="loading"
-      >
-        <div v-if="effectiveMode === 'cards'" class="report-cards">
-          <article
-            v-for="report in reports"
-            :key="report.id"
-            class="report-card"
-            :class="{ selected: isSelected(report.id) }"
-          >
-            <header>
-              <label class="report-identity"
-                ><span class="check-target"
-                  ><input
-                    type="checkbox"
-                    :checked="isSelected(report.id)"
-                    :disabled="wholeQuery"
-                    :aria-label="`选择 ${report.sampleName} ${report.time}`"
-                    @change="toggle(report.id)" /></span
-                ><span
-                  ><strong>{{ report.sampleName || "未命名样品" }}</strong
-                  ><span class="report-time"
-                    >{{ report.date }} · {{ report.time }}</span
-                  ></span
-                ></label
-              ><span v-if="report.isAggregate" class="badge">总分析</span
-              ><span class="badge source-badge"
-                >来源：{{
-                  report.sourceName || report.sourceId || "本机"
-                }}</span
-              ><span v-if="report.instrumentId" class="badge source-badge"
-                >仪器：{{ report.instrumentId }}</span
-              ><span
-                v-if="report.line !== null && report.line !== undefined"
-                class="line-badge"
-                >{{ report.line }} 线</span
-              >
-            </header>
-            <div class="hardness-summary">
-              <div class="average">
-                <span>平均硬度 <small>g</small></span
-                ><strong>{{ showValue(report.averageHardness) }}</strong>
-              </div>
-              <div>
-                <span>最大 <small>g</small></span
-                ><strong>{{ showValue(report.maxHardness) }}</strong>
-              </div>
-              <div>
-                <span>最小 <small>g</small></span
-                ><strong>{{ showValue(report.minHardness) }}</strong>
-              </div>
-            </div>
-            <details
-              class="inline-detail"
-              @toggle="
-                $event.target.open
-                  ? openDetails.add(report.id)
-                  : openDetails.delete(report.id)
-              "
-            >
-              <summary>
-                详细测量<span
-                  >{{ report.testResults?.length || 0 }} 次<ChevronRight
-                    :size="16"
-                /></span>
-              </summary>
-              <ReportDetail
-                v-if="openDetails.has(report.id)"
-                :report="report"
-              />
-            </details>
-          </article>
-        </div>
+      <div class="report-results view-table" :aria-busy="loading">
         <div
-          v-if="effectiveMode === 'table'"
           class="full-table table-wrap"
           tabindex="0"
           aria-label="完整报告表格，可横向滚动"
@@ -893,7 +738,17 @@ onUnmounted(() => {
           <table>
             <thead>
               <tr>
-                <th class="selection-column">选择</th>
+                <th class="selection-column">
+                  <label class="selection-tools check-label">
+                    <input
+                      type="checkbox"
+                      :checked="allSelected"
+                      :indeterminate="!wholeQuery && reports.some((report) => selected.has(report.id)) && !allSelected"
+                      :aria-label="wholeQuery ? '取消整个班次选择' : allSelected ? '取消本页选择' : '选择本页'"
+                      @change="toggleAll"
+                    />本页
+                  </label>
+                </th>
                 <th>日期</th>
                 <th>时间</th>
                 <th>产线</th>
@@ -950,87 +805,13 @@ onUnmounted(() => {
             </tbody>
           </table>
         </div>
-        <div v-if="effectiveMode === 'simple'" class="simple-grid">
-          <p v-if="!simpleReports.length" class="muted">
-            本页没有已选报告；选择保留在其他页，可翻页查看或取消选择。
-          </p>
-          <article
-            v-for="report in simpleReports"
-            :key="report.id"
-            class="simple-card"
-          >
-            <header>
-              <div>
-                <h3>
-                  {{
-                    report.line === null || report.line === undefined
-                      ? report.sampleName
-                      : `${report.line} 线`
-                  }}
-                </h3>
-                <p>
-                  {{ report.sampleName }} · 来源：{{
-                    report.sourceName || report.sourceId || "本机"
-                  }}
-                  <span v-if="report.instrumentId"> · 仪器：{{ report.instrumentId }}</span>
-                </p>
-                <time>{{ report.date }} {{ report.time }}</time>
-              </div>
-              <label class="check-target"
-                ><input
-                  type="checkbox"
-                  :checked="isSelected(report.id)"
-                  :disabled="wholeQuery"
-                  :aria-label="`选择 ${report.sampleName}`"
-                  @change="toggle(report.id)"
-              /></label>
-            </header>
-            <div class="five-grid">
-              <span
-                v-for="(test, index) in report.testResults"
-                :key="index"
-                :title="`第 ${index + 1} 次 · g`"
-                >{{ showValue(test.gram) }}</span
-              >
-            </div>
-            <p v-if="!report.testResults?.length" class="muted">没有测量数据</p>
-            <div class="simple-stats">
-              <span
-                >最大<strong>{{ showValue(report.maxHardness) }}</strong></span
-              ><span class="accent"
-                >平均<strong>{{
-                  showValue(report.averageHardness)
-                }}</strong></span
-              ><span
-                >最小<strong>{{ showValue(report.minHardness) }}</strong></span
-              >
-            </div>
-            <button class="text-button" @click="detail = report">
-              查看完整详情<ChevronRight :size="16" />
-            </button>
-          </article>
-        </div>
-      </div>
-      <div v-if="!hasSelection" class="all-actions">
-        <button
-          class="primary"
-          :disabled="!online || !readyForActions || !!actionBusy"
-          @click="exportReports(false)"
-        >
-          <ArrowDownToLine :size="18" />{{
-            actionBusy === "export" ? "正在导出…" : "导出全部 Excel"
-          }}</button
-        ><button
-          :disabled="!readyForActions || !!actionBusy"
-          @click="generateImages"
-        >
-          <Image :size="18" />{{
-            actionBusy === "image" ? "正在生成…" : "生成图片"
-          }}
-        </button>
-        <p class="field-help">覆盖整个查询，默认排除总分析。</p>
       </div>
     </template>
+    <div v-if="pageCount > 1 || query.page > 1" class="pagination" aria-label="报告分页">
+      <button :disabled="query.page <= 1" @click="query.page--">上一页</button>
+      <span>第 {{ query.page }} / {{ pageCount }} 页</span>
+      <button :disabled="query.page >= pageCount" @click="query.page++">下一页</button>
+    </div>
     <p v-if="actionProgress" class="notice" role="status">
       {{ actionProgress }}
       <button @click="imageController?.abort()">取消生成</button>
@@ -1041,37 +822,6 @@ onUnmounted(() => {
     <p v-if="notice && !imageOpen" role="status" class="success-message">
       {{ notice }}
     </p>
-    <div v-if="hasSelection" class="selection-bar">
-      <div class="selection-summary">
-        <Check :size="18" /><strong>已选 {{ selectionCount }} 份</strong
-        ><button
-          class="icon-button"
-          aria-label="取消全部选择"
-          @click="clearSelection"
-        >
-          <X :size="17" />
-        </button>
-      </div>
-      <div class="selection-actions">
-        <button @click="mode = 'simple'">简易模式</button
-        ><button
-          :disabled="!readyForActions || !!actionBusy"
-          @click="generateImages"
-        >
-          <Image :size="17" /><span>{{
-            actionBusy === "image" ? "生成中…" : "图片"
-          }}</span></button
-        ><button
-          class="primary"
-          :disabled="!online || !readyForActions || !!actionBusy"
-          @click="exportReports(true)"
-        >
-          <ArrowDownToLine :size="17" />{{
-            actionBusy === "export" ? "导出中…" : "导出选中"
-          }}
-        </button>
-      </div>
-    </div>
     <Modal
       v-if="detail"
       :title="`${detail.sampleName || '报告'} · ${detail.date} ${detail.time}`"
