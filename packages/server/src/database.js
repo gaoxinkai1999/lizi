@@ -38,7 +38,6 @@ export function openDatabase(home) {
     );
     CREATE INDEX IF NOT EXISTS reports_timestamp ON reports(timestamp);
     INSERT OR IGNORE INTO settings(key,value) VALUES ('revision','0');
-    INSERT OR IGNORE INTO settings(key,value) VALUES ('authenticationEnabled','false');
   `);
   return db;
 }

@@ -16,30 +16,20 @@ const props = defineProps({
   user: Object,
   status: Object,
   statusError: String,
-  authenticationEnabled: Boolean,
-  initialized: Boolean,
   deploymentMode: String,
 });
 const emit = defineEmits([
   "refresh-status",
   "reports-changed",
-  "access-changed",
 ]);
 const admin = computed(() => props.user?.role === "admin");
 const server = computed(() => props.deploymentMode === "server");
-const accessDescription = computed(() => {
-  if (server.value) return "中心服务器必须登录，账户与权限在账户页管理。";
-  return props.authenticationEnabled
-    ? "使用账户登录后访问，账户与权限在账户页管理。"
-    : "打开链接即可查看报告；局域网配对、目录和上传配置仅限本机管理。";
-});
 const settings = ref(null);
 const loading = ref(false);
 const loadError = ref("");
 const error = ref("");
 const success = ref("");
 const busy = ref("");
-const accessOpen = ref(false);
 const dataPath = ref("");
 const directoryOpen = ref(false);
 const directory = ref(null);
@@ -61,26 +51,6 @@ async function loadSettings() {
     loadError.value = cause.message;
   } finally {
     loading.value = false;
-  }
-}
-async function changeAccess() {
-  if (busy.value) return;
-  busy.value = "access";
-  error.value = "";
-  success.value = "";
-  try {
-    await request("/access", {
-      method: "PUT",
-      body: { authenticationEnabled: !props.authenticationEnabled },
-      localAdmin: true,
-    });
-    accessOpen.value = false;
-    emit("access-changed");
-  } catch (cause) {
-    error.value = cause.message;
-    accessOpen.value = false;
-  } finally {
-    busy.value = "";
   }
 }
 async function saveDirectory() {
@@ -181,24 +151,17 @@ onUnmounted(() => {
     </div>
     <p v-if="error" class="error-message" role="alert">{{ error }}</p>
     <p v-if="success" class="success-message" role="status">{{ success }}</p>
-    <section v-if="admin" class="settings-section">
+    <section v-if="admin && server" class="settings-section">
       <div class="section-heading">
         <ShieldCheck :size="21" />
         <div>
           <h2>访问鉴权</h2>
-          <p>
-            {{
-              authenticationEnabled ? "已开启 · 需要登录" : "已关闭 · 完全公开"
-            }}
-          </p>
+          <p>已开启 · 需要登录</p>
         </div>
       </div>
       <p class="muted">
-        {{ accessDescription }}
+        中心服务器必须登录，账户与权限在账户页管理。
       </p>
-      <button v-if="!server" :disabled="!!busy" @click="accessOpen = true">
-        {{ authenticationEnabled ? "关闭鉴权" : "启用鉴权" }}
-      </button>
     </section>
     <section class="settings-section">
       <div class="section-heading">
@@ -339,32 +302,6 @@ onUnmounted(() => {
         </template
       ></template
     >
-    <Modal
-      v-if="!server && accessOpen"
-      :title="authenticationEnabled ? '关闭访问鉴权？' : '启用访问鉴权？'"
-      @close="accessOpen = false"
-    >
-      <p v-if="authenticationEnabled" class="muted">
-        关闭后，任何能访问此地址的人都可查看报告。本机管理限制仍然生效。
-        已有账户会保留，所有客户端立即切换为公开访问。
-      </p>
-      <template v-else>
-        <p class="muted">启用后，所有客户端都需要登录才能继续使用。</p>
-        <p class="muted">
-          {{
-            initialized
-              ? "已有账户会继续保留，请确保记得管理员账户与密码。"
-              : "尚无账户，接下来需要使用服务本机的设置令牌创建管理员。本机桌面会自动读取令牌。"
-          }}
-        </p>
-      </template>
-      <template #footer>
-        <button :disabled="!!busy" @click="accessOpen = false">取消</button>
-        <button class="primary" :disabled="!!busy" @click="changeAccess">
-          {{ busy === "access" ? "正在切换…" : "确认切换" }}
-        </button>
-      </template>
-    </Modal>
     <Modal
       v-if="!server && directoryOpen"
       title="选择报告目录"

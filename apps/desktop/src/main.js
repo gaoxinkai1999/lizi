@@ -358,19 +358,6 @@ else {
           await writeFile(preferences, "1", { mode: 0o600 });
         }
       }
-      ipcMain.handle("lizi:get-setup-token", async (event) => {
-        assertTrustedSender(event);
-        const response = await fetch(`${origin}/api/auth/state`, {
-          signal: AbortSignal.timeout(3000),
-        });
-        if (!response.ok || (await response.json()).initialized) return null;
-        try {
-          return (await readFile(join(home, "setup-token.txt"), "utf8")).trim();
-        } catch (error) {
-          if (error.code === "ENOENT") return null;
-          throw new Error("无法读取本机初始化凭据，请联系安装管理员");
-        }
-      });
       ipcMain.handle("lizi:get-local-admin-token", async (event) => {
         assertTrustedSender(event);
         try {

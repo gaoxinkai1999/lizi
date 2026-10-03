@@ -266,7 +266,6 @@ test("2.0.0 database migration preserves reports/settings/users and reconciles r
   const policy = await createDirectoryPolicy(home, JSON.stringify([root]));
   const db = openDatabase(home);
   setSetting(db, "dataPath", root);
-  setSetting(db, "authenticationEnabled", "true");
   db.prepare(
     "INSERT INTO users(id,username,password,role) VALUES('u','legacy','hash','admin')",
   ).run();
@@ -297,12 +296,6 @@ test("2.0.0 database migration preserves reports/settings/users and reconciles r
   assert.equal(
     db.prepare("SELECT username FROM users WHERE id='u'").get().username,
     "legacy",
-  );
-  assert.equal(
-    db
-      .prepare("SELECT value FROM settings WHERE key='authenticationEnabled'")
-      .get().value,
-    "true",
   );
   await store.close();
   await fs.rm(file);

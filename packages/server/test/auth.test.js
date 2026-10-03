@@ -3,11 +3,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { request as httpRequest } from "node:http";
+import { Readable } from "node:stream";
 import { setTimeout } from "node:timers/promises";
 import { createApplication } from "../src/app.js";
+import { openDatabase, setSetting } from "../src/database.js";
 
-async function fixture(t) {
+async function fixture(t, { mode = "client", prepare } = {}) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "lizi-auth-"));
+  await prepare?.(home);
   const token = "a-secure-one-time-bootstrap-token-for-tests";
   let runtime;
   let server;
@@ -15,7 +19,8 @@ async function fixture(t) {
   async function start() {
     runtime = await createApplication({
       home,
-      setupToken: token,
+      mode,
+      setupToken: mode === "server" ? token : undefined,
       allowedRoots: JSON.stringify([home]),
     });
     server = runtime.app.listen(0, "127.0.0.1");
@@ -29,9 +34,9 @@ async function fixture(t) {
     await runtime.close();
   }
   await start();
-  const localAdminToken = (
-    await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
-  ).trim();
+  const localAdminToken = mode === "client"
+    ? (await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")).trim()
+    : null;
   t.after(async () => {
     await stop();
     await fs.rm(home, { recursive: true, force: true });
@@ -40,30 +45,30 @@ async function fixture(t) {
     route,
     { method = "GET", body, cookie, headers = {} } = {},
   ) {
-    return fetch(`${origin}${route}`, {
-      method,
-      signal: AbortSignal.timeout(10000),
-      headers: {
-        Origin: origin,
-        "Content-Type": "application/json",
-        "X-Lizi-Request": "1",
-        ...(cookie ? { Cookie: cookie } : {}),
-        ...headers,
-      },
-      body: body === undefined ? undefined : JSON.stringify(body),
+    return new Promise((resolve, reject) => {
+      const outgoing = httpRequest(`${origin}${route}`, {
+        method,
+        signal: AbortSignal.timeout(10000),
+        headers: {
+          Origin: origin,
+          "Content-Type": "application/json",
+          "X-Lizi-Request": "1",
+          ...(cookie ? { Cookie: cookie } : {}),
+          ...headers,
+        },
+      }, (incoming) => resolve(new Response(Readable.toWeb(incoming), {
+        status: incoming.statusCode,
+        headers: incoming.headers,
+      })));
+      outgoing.on("error", reject);
+      outgoing.end(body === undefined ? undefined : JSON.stringify(body));
     });
   }
   return {
     request,
     token,
     home,
-    setAccess: (authenticationEnabled, cookie) =>
-      request("/api/access", {
-        method: "PUT",
-        body: { authenticationEnabled },
-        cookie,
-        headers: { "X-Lizi-Local-Admin": localAdminToken },
-      }),
+    localAdminToken,
     async restart() {
       await stop();
       await start();
@@ -74,7 +79,7 @@ async function fixture(t) {
 const password = "a-password-long-enough";
 
 test("LAN configuration remains local-only even when the report site is public", async (t) => {
-  const { request, home } = await fixture(t);
+  const { request, localAdminToken } = await fixture(t);
   const local = await (await request("/api/lan")).json();
   assert.equal(local.canManage, false);
   assert.deepEqual(local.addresses, []);
@@ -83,9 +88,7 @@ test("LAN configuration remains local-only even when the report site is public",
   const managed = await (
     await request("/api/lan", {
       headers: {
-        "X-Lizi-Local-Admin": (
-          await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
-        ).trim(),
+        "X-Lizi-Local-Admin": localAdminToken,
       },
     })
   ).json();
@@ -98,12 +101,24 @@ test("LAN configuration remains local-only even when the report site is public",
     const response = await request("/api/lan", {
       method: "PUT",
       body: { mode: "collector", name: "unauthorized" },
-      headers,
+      headers: { "X-Lizi-Local-Admin": localAdminToken, ...headers },
     });
     assert.equal(response.status, 403);
-    const status = await (await request("/api/lan", { headers })).json();
+    const status = await (await request("/api/lan", {
+      headers: { "X-Lizi-Local-Admin": localAdminToken, ...headers },
+    })).json();
     assert.equal(status.canManage, false);
     assert.equal(status.mode, "standalone");
+  }
+  for (const [route, method, body] of [
+    ["/api/settings", "PUT", { dataPath: "" }],
+    ["/api/scan", "POST", {}],
+    ["/api/sync", "PUT", { enabled: true }],
+    ["/api/sync/retry", "POST", {}],
+    ["/api/sync/backfill", "POST", {}],
+    ["/api/lan", "PUT", { mode: "collector" }],
+  ]) {
+    assert.equal((await request(route, { method, body })).status, 403, route);
   }
   assert.equal(
     (
@@ -117,8 +132,17 @@ test("LAN configuration remains local-only even when the report site is public",
 });
 
 test("bootstrap needs a token and same-origin marker; sessions enforce role and immediate disable", async (t) => {
-  const { request, token, setAccess } = await fixture(t);
-  assert.equal((await setAccess(true)).status, 200);
+  const { request, token } = await fixture(t, {
+    mode: "server",
+    prepare(home) {
+      const db = openDatabase(home);
+      setSetting(db, "authenticationEnabled", false);
+      db.close();
+    },
+  });
+  const state = await (await request("/api/auth/state")).json();
+  assert.equal(state.authenticationEnabled, true);
+  assert.equal(state.user, null);
   assert.equal((await request("/api/reports")).status, 401);
   assert.equal(
     (
@@ -158,16 +182,24 @@ test("bootstrap needs a token and same-origin marker; sessions enforce role and 
     ).status,
     409,
   );
+  assert.equal(
+    (await request(`/api/users/${admin.id}`, {
+      method: "PATCH", cookie, body: { role: "viewer" },
+    })).status,
+    409,
+  );
   const added = await request("/api/users", {
     method: "POST",
     cookie,
     body: { username: "viewer", password, role: "viewer" },
   });
+  assert.equal(added.status, 201);
   const viewer = (await added.json()).user;
   const login = await request("/api/auth/login", {
     method: "POST",
     body: { username: "viewer", password },
   });
+  assert.equal(login.status, 200);
   const viewerCookie = login.headers.get("set-cookie").split(";")[0];
   assert.equal(
     (await request("/api/status", { cookie: viewerCookie })).status,
@@ -177,7 +209,11 @@ test("bootstrap needs a token and same-origin marker; sessions enforce role and 
     (await request("/api/settings", { cookie: viewerCookie })).status,
     403,
   );
-  assert.equal((await setAccess(false, viewerCookie)).status, 403);
+  assert.equal((await request("/api/users", { cookie: viewerCookie })).status, 403);
+  assert.equal((await request("/api/users", {
+    method: "POST", cookie: viewerCookie,
+    body: { username: "unauthorized", password, role: "admin" },
+  })).status, 403);
   assert.equal(
     (
       await request("/api/auth/password", {
@@ -189,6 +225,9 @@ test("bootstrap needs a token and same-origin marker; sessions enforce role and 
     ).status,
     403,
   );
+  const stream = await request("/api/events", { cookie: viewerCookie });
+  assert.equal(stream.status, 200);
+  const closed = stream.text();
   assert.equal(
     (
       await request(`/api/users/${viewer.id}`, {
@@ -199,6 +238,7 @@ test("bootstrap needs a token and same-origin marker; sessions enforce role and 
     ).status,
     200,
   );
+  await closed;
   assert.equal(
     (await request("/api/status", { cookie: viewerCookie })).status,
     401,
@@ -215,15 +255,13 @@ test("bootstrap needs a token and same-origin marker; sessions enforce role and 
 });
 
 test("public access serves reports and administration without cookies but rejects account APIs and cross-origin writes", async (t) => {
-  const { request, token, home, restart } = await fixture(t);
+  const { request, token, home, localAdminToken, restart } = await fixture(t);
   const state = await (await request("/api/auth/state")).json();
   assert.equal(state.authenticationEnabled, false);
   assert.equal(state.initialized, false);
-  assert.deepEqual(state.user, {
-    id: "public",
-    username: "公开访问",
-    role: "admin",
-  });
+  assert.equal(state.user.id, "public");
+  assert.equal(state.user.role, "admin");
+  await assert.rejects(fs.stat(path.join(home, "setup-token.txt")), { code: "ENOENT" });
   const root = path.join(home, "reports");
   await fs.mkdir(path.join(root, "2026-09-23", "instrument"), {
     recursive: true,
@@ -299,8 +337,11 @@ test("public access serves reports and administration without cookies but reject
     ["/api/users", "GET"],
     ["/api/users", "POST", { username: "admin", password, role: "admin" }],
     ["/api/users/public", "PATCH", { password: "different-long-password" }],
+    ["/api/access", "PUT", { authenticationEnabled: true }],
   ]) {
-    assert.equal((await request(route, { method, body })).status, 409, route);
+    assert.equal((await request(route, {
+      method, body, headers: { "X-Lizi-Local-Admin": localAdminToken },
+    })).status, 404, route);
   }
   for (const headers of [
     { Origin: "https://attacker.example" },
@@ -308,34 +349,22 @@ test("public access serves reports and administration without cookies but reject
   ]) {
     assert.equal(
       (
-        await request("/api/access", {
-          method: "PUT",
-          body: { authenticationEnabled: true },
+        await request("/api/reports/export", {
+          method: "POST",
+          body: { date: "2026-09-23", shift: "day" },
           headers,
         })
       ).status,
       403,
     );
     assert.equal(
-      (await request("/api/scan", { method: "POST", body: {}, headers }))
-        .status,
+      (await request("/api/scan", {
+        method: "POST", body: {},
+        headers: { "X-Lizi-Local-Admin": localAdminToken, ...headers },
+      })).status,
       403,
     );
   }
-  assert.equal(
-    (
-      await request("/api/access", {
-        method: "PUT",
-        body: { authenticationEnabled: "true" },
-        headers: {
-          "X-Lizi-Local-Admin": (
-            await fs.readFile(path.join(home, "lan-admin-token.txt"), "utf8")
-          ).trim(),
-        },
-      })
-    ).status,
-    400,
-  );
   await restart();
   const restarted = await (await request("/api/auth/state")).json();
   assert.equal(restarted.authenticationEnabled, false);
@@ -343,97 +372,73 @@ test("public access serves reports and administration without cookies but reject
   assert.equal((await request("/api/reports?date=2026-09-23")).status, 200);
 });
 
-test("access changes close every stream, revoke old sessions, preserve accounts and persist across restart", async (t) => {
-  const { request, token, setAccess, restart } = await fixture(t);
-  const publicStreams = await Promise.all(
-    Array.from({ length: 9 }, () => request("/api/events")),
-  );
-  for (const stream of publicStreams) assert.equal(stream.status, 200);
-  const publicClosed = publicStreams.map((stream) => stream.text());
-  assert.deepEqual(await (await setAccess(true)).json(), {
-    authenticationEnabled: true,
-    initialized: false,
+test("legacy client accounts and enabled settings cannot impose a login wall", async (t) => {
+  const { request, home, restart } = await fixture(t, {
+    prepare(home) {
+      const db = openDatabase(home);
+      setSetting(db, "authenticationEnabled", true);
+      db.prepare("INSERT INTO users(id,username,password,role) VALUES(?,?,?,?)")
+        .run("legacy-user", "legacy-admin", "retained-password-hash", "admin");
+      db.close();
+    },
   });
-  for (const stream of await Promise.all(publicClosed)) {
-    assert.match(
-      stream,
-      /event: access\ndata: \{"authenticationEnabled":true\}\n\n$/,
-    );
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const state = await (await request("/api/auth/state")).json();
+    assert.equal(state.authenticationEnabled, false);
+    assert.equal(state.user.id, "public");
+    assert.equal((await request("/api/reports")).status, 200);
+    assert.equal((await request("/api/settings")).status, 200);
+    assert.equal((await request("/api/users")).status, 404);
+    if (attempt === 0) await restart();
   }
-  assert.equal((await request("/api/events")).status, 401);
-  assert.equal((await request("/api/reports")).status, 401);
-  assert.equal((await setAccess(false)).status, 401);
+  const db = openDatabase(home);
+  try {
+    const user = db.prepare("SELECT username,password FROM users WHERE id=?").get("legacy-user");
+    assert.equal(user.username, "legacy-admin");
+    assert.equal(user.password, "retained-password-hash");
+  } finally {
+    db.close();
+  }
+});
+
+test("server password changes revoke existing sessions and streams and survive restart", async (t) => {
+  const { request, token, restart } = await fixture(t, { mode: "server" });
   const setup = await request("/api/auth/setup", {
-    method: "POST",
-    body: { token, username: "admin", password },
+    method: "POST", body: { token, username: "admin", password },
   });
   assert.equal(setup.status, 201);
-  const admin = (await setup.json()).user;
-  const setupCookie = setup.headers.get("set-cookie").split(";")[0];
-  await restart();
-  const enabledState = await (await request("/api/auth/state")).json();
-  assert.equal(enabledState.authenticationEnabled, true);
-  assert.equal(enabledState.initialized, true);
-  assert.equal(enabledState.user, null);
-  assert.equal((await request("/api/reports")).status, 401);
-  assert.equal(
-    (await request("/api/settings", { cookie: setupCookie })).status,
-    200,
-  );
+  const oldCookie = setup.headers.get("set-cookie").split(";")[0];
   const login = await request("/api/auth/login", {
-    method: "POST",
-    body: { username: "admin", password },
+    method: "POST", body: { username: "admin", password },
   });
   assert.equal(login.status, 200);
   const cookie = login.headers.get("set-cookie").split(";")[0];
-  const authenticatedStreams = await Promise.all([
-    request("/api/events", { cookie: setupCookie }),
-    request("/api/events", { cookie }),
-  ]);
-  for (const stream of authenticatedStreams) assert.equal(stream.status, 200);
-  const authenticatedClosed = authenticatedStreams.map((stream) =>
-    stream.text(),
-  );
-  assert.deepEqual(await (await setAccess(false, cookie)).json(), {
-    authenticationEnabled: false,
-    initialized: true,
+  const stream = await request("/api/events", { cookie: oldCookie });
+  assert.equal(stream.status, 200);
+  const closed = stream.text();
+  const changed = await request("/api/auth/password", {
+    method: "POST", cookie,
+    body: { currentPassword: password, password: "a-different-long-password" },
   });
-  for (const stream of await Promise.all(authenticatedClosed)) {
-    assert.match(
-      stream,
-      /event: access\ndata: \{"authenticationEnabled":false\}\n\n$/,
-    );
-  }
-  assert.equal((await request("/api/reports")).status, 200);
-  const publicState = await (
-    await request("/api/auth/state", { cookie })
-  ).json();
-  assert.equal(publicState.authenticationEnabled, false);
-  assert.equal(publicState.initialized, true);
-  assert.equal(publicState.user.id, "public");
-  assert.equal(
-    (
-      await request(`/api/users/${admin.id}`, {
-        method: "PATCH",
-        cookie,
-        body: { password: "different-long-password" },
-      })
-    ).status,
-    409,
-  );
-  await restart();
-  const settings = await (await request("/api/settings")).json();
-  assert.equal(settings.authenticationEnabled, false);
-  assert.equal((await setAccess(true)).status, 200);
+  assert.equal(changed.status, 200);
+  await closed;
+  const newCookie = changed.headers.get("set-cookie").split(";")[0];
+  assert.equal((await request("/api/reports", { cookie: oldCookie })).status, 401);
   assert.equal((await request("/api/reports", { cookie })).status, 401);
-  assert.equal(
-    (await request("/api/reports", { cookie: setupCookie })).status,
-    401,
-  );
+  assert.equal((await request("/api/reports", { cookie: newCookie })).status, 200);
+  await restart();
+  assert.equal((await request("/api/reports")).status, 401);
+  assert.equal((await request("/api/reports", { cookie: newCookie })).status, 200);
+  assert.equal((await request("/api/auth/login", {
+    method: "POST", body: { username: "admin", password },
+  })).status, 401);
   const relogin = await request("/api/auth/login", {
-    method: "POST",
-    body: { username: "admin", password },
+    method: "POST", body: { username: "admin", password: "a-different-long-password" },
   });
   assert.equal(relogin.status, 200);
-  assert.deepEqual((await relogin.json()).user, admin);
+  const reloginCookie = relogin.headers.get("set-cookie").split(";")[0];
+  assert.equal((await request("/api/auth/logout", {
+    method: "POST", cookie: reloginCookie, body: {},
+  })).status, 200);
+  assert.equal((await request("/api/reports", { cookie: reloginCookie })).status, 401);
 });

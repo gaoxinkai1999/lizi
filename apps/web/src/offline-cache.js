@@ -119,9 +119,10 @@ export function readSession() {
   );
 }
 export async function sessionScope(state) {
-  if (state.authenticationEnabled && !state.user) return "";
+  const authenticationEnabled = state.deploymentMode === "server";
+  if (authenticationEnabled && !state.user) return "";
   const identity = JSON.stringify([
-    state.authenticationEnabled,
+    authenticationEnabled,
     state.deploymentMode || "client",
     state.user?.id,
     state.user?.role,

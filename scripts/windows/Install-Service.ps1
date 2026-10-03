@@ -58,17 +58,15 @@ try {
         Write-LiziProgress ('Report directory {0} ACL policy checked ({1:N1}s); effective access is not verified.' -f $rootNumber, $aclWatch.Elapsed.TotalSeconds)
     }
 
-    # Only the interactive installing user can read local desktop management credentials.
-    foreach ($credentialName in @('setup-token.txt', 'lan-admin-token.txt')) {
-        $tokenPath = Join-Path $DataHome $credentialName
-        if (-not (Test-Path -LiteralPath $tokenPath)) {
-            $bytes = New-Object byte[] 32
-            $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-            try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-            Write-Utf8 $tokenPath ([Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'))
-        }
-        Set-PrivateAcl $tokenPath $sid -Token
+    # Only the interactive installing user can read the local management credential.
+    $tokenPath = Join-Path $DataHome 'lan-admin-token.txt'
+    if (-not (Test-Path -LiteralPath $tokenPath)) {
+        $bytes = New-Object byte[] 32
+        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        Write-Utf8 $tokenPath ([Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'))
     }
+    Set-PrivateAcl $tokenPath $sid -Token
 
     # Service binaries/configuration must never be writable by its low-privilege account.
     Write-LiziProgress 'Protecting packaged programs and service configuration.'

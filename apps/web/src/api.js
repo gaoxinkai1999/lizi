@@ -53,10 +53,7 @@ export async function request(
         const sessionExpired =
           response.status === 401 &&
           !["/auth/login", "/auth/setup", "/auth/state"].includes(path);
-        const accessChanged =
-          response.status === 409 &&
-          (path.startsWith("/auth/") || path.startsWith("/users"));
-        if (sessionExpired || accessChanged) {
+        if (sessionExpired) {
           writesAllowed = false;
           window.dispatchEvent(new Event("lizi:unauthorized"));
         }

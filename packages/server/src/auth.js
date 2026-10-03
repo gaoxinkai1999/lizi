@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { httpError } from "./directories.js";
-import { getSetting, setSetting, transaction } from "./database.js";
+import { transaction } from "./database.js";
 
 const derive = promisify(scrypt);
 const SESSION_AGE = 12 * 60 * 60 * 1000;
@@ -100,43 +100,15 @@ export function requireSameOrigin(req, res, next) {
 export async function createAuth(
   db,
   home,
+  isServer,
   configuredToken,
   onRevoke = () => {},
-  onAccessChange = () => {},
 ) {
-  const tokenPath = path.join(home, "setup-token.txt");
-  let setupToken = "";
   const initialized = () =>
     Boolean(db.prepare("SELECT 1 FROM users LIMIT 1").get());
-  const authenticationEnabled = () =>
-    getSetting(db, "authenticationEnabled", "false") === "true";
-  let accessGeneration = 0;
-  function assertAccounts(req) {
-    if (!authenticationEnabled())
-      throw httpError(409, "公开模式下账户功能已关闭");
-    if (req.accessGeneration !== accessGeneration)
-      throw httpError(409, "访问模式已变更，请重试");
-  }
-  function accountsGuard(req, res, next) {
-    req.accessGeneration = accessGeneration;
-    assertAccounts(req);
-    next();
-  }
-  function setAccess(req, res) {
-    const enabled = req.body.authenticationEnabled;
-    if (typeof enabled !== "boolean")
-      throw httpError(400, "鉴权开关必须为布尔值");
-    if (enabled !== authenticationEnabled()) {
-      transaction(db, () => {
-        setSetting(db, "authenticationEnabled", enabled);
-        db.exec("DELETE FROM sessions");
-      });
-      accessGeneration += 1;
-      res.clearCookie(COOKIE, { ...cookieOptions(req), maxAge: undefined });
-      onAccessChange(enabled);
-    }
-    res.json({ authenticationEnabled: enabled, initialized: initialized() });
-  }
+  if (!isServer) return { initialized, identity, guard, admin };
+  const tokenPath = path.join(home, "setup-token.txt");
+  let setupToken = "";
   if (!initialized()) {
     if (configuredToken) {
       if (configuredToken.length < 32)
@@ -185,7 +157,7 @@ export async function createAuth(
     );
   }
   function identity(req) {
-    return authenticationEnabled() ? session(req) : PUBLIC_USER;
+    return isServer ? session(req) : PUBLIC_USER;
   }
   function issue(req, res, user) {
     const value = randomBytes(32).toString("base64url");
@@ -242,7 +214,6 @@ export async function createAuth(
       throw httpError(403, "初始化令牌无效");
     validateUsername(username);
     const encoded = await hashPassword(password);
-    assertAccounts(req);
     const user = { id: randomUUID(), username, role: "admin" };
     transaction(db, () => {
       if (initialized()) throw httpError(409, "系统已经初始化");
@@ -254,7 +225,6 @@ export async function createAuth(
     await fs
       .rm(tokenPath, { force: true })
       .catch((error) => console.error("无法清理初始化令牌文件:", error.code));
-    assertAccounts(req);
     issue(req, res, user);
     res.status(201).json({ user });
   }
@@ -270,7 +240,6 @@ export async function createAuth(
       password,
       user?.password ?? dummyPassword,
     );
-    assertAccounts(req);
     if (!user || user.disabled || !valid)
       throw httpError(401, "用户名或密码错误");
     // A concurrent password reset or disable must defeat an in-flight login.
@@ -296,7 +265,6 @@ export async function createAuth(
     if (!(await verifyPassword(req.body.currentPassword, req.user.password)))
       throw httpError(403, "当前密码错误");
     const encoded = await hashPassword(req.body.password);
-    assertAccounts(req);
     transaction(db, () => {
       const current = session(req);
       if (!current || current.password !== req.user.password)
@@ -328,7 +296,6 @@ export async function createAuth(
     const role = req.body.role;
     if (!["admin", "viewer"].includes(role)) throw httpError(400, "角色无效");
     const encoded = await hashPassword(req.body.password);
-    assertAccounts(req);
     if (session(req)?.role !== "admin")
       throw httpError(403, "管理员权限已失效");
     if (db.prepare("SELECT 1 FROM users WHERE username=?").get(username))
@@ -349,7 +316,6 @@ export async function createAuth(
       throw httpError(400, "没有可更新的字段");
     const encoded =
       password === undefined ? undefined : await hashPassword(password);
-    assertAccounts(req);
     const result = transaction(db, () => {
       if (session(req)?.role !== "admin")
         throw httpError(403, "管理员权限已失效");
@@ -384,11 +350,7 @@ export async function createAuth(
   }
   return {
     initialized,
-    authenticationEnabled,
-    accountsGuard,
-    setAccess,
     identity,
-    session,
     guard,
     admin,
     setup,

@@ -67,7 +67,6 @@ export async function createApplication(options = {}) {
     throw new Error("客户端和服务器必须使用独立数据目录，禁止混用已有数据库");
   }
   setSetting(db, "deploymentMode", deploymentMode);
-  if (isServer) setSetting(db, "authenticationEnabled", true);
   const directories = isServer ? null : await createDirectoryPolicy(
     home,
     options.allowedRoots ?? process.env.LIZI_ALLOWED_ROOTS,
@@ -76,18 +75,11 @@ export async function createApplication(options = {}) {
   const auth = await createAuth(
     db,
     home,
+    isServer,
     options.setupToken ?? process.env.LIZI_SETUP_TOKEN,
     (userId) => {
       for (const client of clients)
         if (client.userId === userId) client.res.end();
-    },
-    (authenticationEnabled) => {
-      for (const client of clients) {
-        client.res.end(
-          `event: access\ndata: ${JSON.stringify({ authenticationEnabled })}\n\n`,
-        );
-      }
-      clients.clear();
     },
   );
   let localStore;
@@ -164,7 +156,7 @@ export async function createApplication(options = {}) {
     res.json({
       deploymentMode,
       initialized: auth.initialized(),
-      authenticationEnabled: auth.authenticationEnabled(),
+      authenticationEnabled: isServer,
       user: user ? publicUser(user) : null,
       dataRoot: user ? store.root : null,
       dataScope: user ? (lan?.getSettings().epoch ?? 0) : null,
@@ -172,15 +164,18 @@ export async function createApplication(options = {}) {
       today: todayString(),
     });
   });
-  app.use(["/api/auth", "/api/users"], auth.accountsGuard);
-  app.post("/api/auth/setup", auth.setup);
-  app.post("/api/auth/login", auth.login);
+  if (isServer) {
+    app.post("/api/auth/setup", auth.setup);
+    app.post("/api/auth/login", auth.login);
+  }
   app.use("/api", auth.guard);
-  if (!isServer) app.put("/api/access", auth.admin, requireLocalAdmin, auth.setAccess);
   if (isServer) app.use("/api/devices", auth.admin, cloud.adminRouter);
-  app.post("/api/auth/logout", auth.logout);
-  app.post("/api/auth/password", auth.changePassword);
+  if (isServer) {
+    app.post("/api/auth/logout", auth.logout);
+    app.post("/api/auth/password", auth.changePassword);
+  }
   function assertCurrentIdentity(req) {
+    if (!isServer) return;
     const current = auth.identity(req);
     if (
       !current ||
@@ -306,7 +301,7 @@ export async function createApplication(options = {}) {
       deploymentMode,
       dataPath: store.root,
       allowedRoots: directories?.allowedRoots ?? [],
-      authenticationEnabled: auth.authenticationEnabled(),
+      authenticationEnabled: isServer,
     };
   }
   app.get("/api/settings", auth.admin, (req, res) => res.json(settings()));
@@ -399,9 +394,11 @@ export async function createApplication(options = {}) {
       res.json(lanStatus(req));
     });
   }
-  app.get("/api/users", auth.admin, auth.listUsers);
-  app.post("/api/users", auth.admin, auth.addUser);
-  app.patch("/api/users/:id", auth.admin, auth.updateUser);
+  if (isServer) {
+    app.get("/api/users", auth.admin, auth.listUsers);
+    app.post("/api/users", auth.admin, auth.addUser);
+    app.patch("/api/users/:id", auth.admin, auth.updateUser);
+  }
   function sendEvent(client, event, data) {
     const user = auth.identity(client.req);
     if (!user || user.id !== client.userId) {
@@ -419,11 +416,10 @@ export async function createApplication(options = {}) {
     );
   }
   app.get("/api/events", (req, res) => {
-    const authenticationEnabled = auth.authenticationEnabled();
-    const connections = authenticationEnabled
+    const connections = isServer
       ? [...clients].filter((client) => client.userId === req.user.id).length
       : clients.size;
-    const limit = authenticationEnabled ? 8 : 128;
+    const limit = isServer ? 8 : 128;
     if (connections >= limit)
       throw httpError(429, "实时连接过多，请关闭多余页面");
     res.status(200).set({

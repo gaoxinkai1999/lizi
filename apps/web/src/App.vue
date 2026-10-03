@@ -23,8 +23,8 @@ import AccountsView from "./components/AccountsView.vue";
 const ready = ref(false);
 const bootError = ref("");
 const initialized = ref(true);
-const authenticationEnabled = ref(false);
 const deploymentMode = ref("client");
+const server = computed(() => deploymentMode.value === "server");
 const user = ref(null);
 const today = ref(localDate());
 const page = ref("reports");
@@ -57,12 +57,12 @@ const nav = computed(() => [
   {
     id: "settings",
     label:
-      !authenticationEnabled.value || user.value?.role === "admin"
+      !server.value || user.value?.role === "admin"
         ? "设置"
         : "状态",
     icon: Settings2,
   },
-  ...(authenticationEnabled.value
+  ...(server.value
     ? [{ id: "accounts", label: "账户", icon: UsersRound }]
     : []),
 ]);
@@ -122,7 +122,6 @@ async function refreshState() {
     });
     if (sequence !== stateSequence) return;
     const identityChanged =
-      data.authenticationEnabled !== authenticationEnabled.value ||
       (data.deploymentMode || "client") !== deploymentMode.value ||
       Boolean(user.value) !== Boolean(data.user) ||
       (user.value &&
@@ -131,7 +130,7 @@ async function refreshState() {
     const topologyChanged =
       nextScope !== scope.value ||
       data.dataRoot !== dataRoot.value ||
-      data.dataScope !== dataScope.value ||
+      (data.dataScope || "") !== dataScope.value ||
       Boolean(data.transientReports) !== transientReports.value;
     const changed = identityChanged || topologyChanged;
     if (changed) {
@@ -145,7 +144,6 @@ async function refreshState() {
       if (hadIdentity) await clearReportCache();
       if (sequence !== stateSequence) return;
     }
-    authenticationEnabled.value = data.authenticationEnabled;
     deploymentMode.value = data.deploymentMode || "client";
     initialized.value = data.initialized;
     today.value = data.today || localDate();
@@ -163,11 +161,10 @@ async function refreshState() {
         dataRoot: dataRoot.value,
         dataScope: dataScope.value,
         transientReports: transientReports.value,
-        authenticationEnabled: data.authenticationEnabled,
         deploymentMode: deploymentMode.value,
         today: today.value,
         savedAt: Date.now(),
-        query: initialQuery.value,
+        query: initialQuery.value ? { ...initialQuery.value } : null,
       });
     if (sequence !== stateSequence) return;
     failures = 0;
@@ -253,7 +250,6 @@ function startSession() {
       /* The next status poll can recover. */
     }
   });
-  source.addEventListener("access", invalidateSession);
   source.onerror = () => {
     if (events === source) live.value = false;
   };
@@ -291,7 +287,7 @@ function authenticated() {
   return invalidateSession();
 }
 async function logout() {
-  if (!verified.value) return;
+  if (!server.value || !verified.value) return;
   logoutBusy.value = true;
   try {
     await request("/auth/logout", { method: "POST", body: {} });
@@ -336,7 +332,6 @@ onMounted(async () => {
     dataRoot.value = cached.dataRoot;
     dataScope.value = cached.dataScope || "";
     transientReports.value = Boolean(cached.transientReports);
-    authenticationEnabled.value = cached.authenticationEnabled;
     deploymentMode.value = cached.deploymentMode || "client";
     today.value = cached.today || localDate();
     initialQuery.value = cached.query;
@@ -377,9 +372,8 @@ onUnmounted(() => {
     <p v-else class="muted">正在连接服务…</p>
   </main>
   <AuthView
-    v-else-if="authenticationEnabled && !user && !offlineSession"
+    v-else-if="server && !user && !offlineSession"
     :initialized="initialized"
-    :deployment-mode="deploymentMode"
     :message="message"
     :offline="!verified"
     @authenticated="authenticated"
@@ -401,7 +395,7 @@ onUnmounted(() => {
           <component :is="item.icon" :size="20" /><span>{{ item.label }}</span>
         </button>
       </nav>
-      <div v-if="authenticationEnabled" class="sidebar-bottom">
+      <div v-if="server" class="sidebar-bottom">
         <span v-if="user" class="avatar">{{
           user.username.slice(0, 1).toUpperCase()
         }}</span>
@@ -435,7 +429,7 @@ onUnmounted(() => {
           }}</span
         >
         <button
-          v-if="authenticationEnabled && user"
+          v-if="server && user"
           class="icon-button mobile-logout"
           aria-label="退出登录"
           :disabled="logoutBusy || !verified"
@@ -445,7 +439,7 @@ onUnmounted(() => {
         </button>
       </header>
       <div v-if="!verified" class="shell-message notice" role="status">
-        仅显示此前缓存的报告，未缓存页不可离线查看。缓存不是登录凭据，设置与账户操作需联网验证。
+        仅显示此前缓存的报告，未缓存页不可离线查看。{{ server ? "缓存不是登录凭据，设置与账户操作需联网验证。" : "设置操作需连接本机服务。" }}
         <button @click="boot">重新连接</button>
       </div>
       <div v-if="cacheMessage" class="shell-message notice" role="status">
@@ -479,18 +473,13 @@ onUnmounted(() => {
           v-if="page === 'settings' && verified && user"
           :user="user"
           :deployment-mode="deploymentMode"
-          :authentication-enabled="authenticationEnabled"
-          :initialized="initialized"
           :status="status"
           :status-error="statusError"
           @refresh-status="loadStatus"
           @reports-changed="refreshKey++"
-          @access-changed="boot"
         />
         <AccountsView
-          v-if="
-            authenticationEnabled && page === 'accounts' && verified && user
-          "
+          v-if="server && page === 'accounts' && verified && user"
           :user="user"
           @logout="logout"
           @user-changed="refreshState"
