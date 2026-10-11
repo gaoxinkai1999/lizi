@@ -13,6 +13,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createUpdateManager } from "./client-updates.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const origin = "http://127.0.0.1:3210";
@@ -28,6 +29,8 @@ let loading = false;
 let retryTimer;
 let waitingForBackend = false;
 let networkOperation = false;
+let updateManager = null;
+let updateManagerError = "更新组件不可用";
 const executeFile = promisify(execFile);
 
 function assertTrustedSender(event) {
@@ -222,6 +225,41 @@ function icon() {
 
 const waitingPage = `<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>粒子报告</title><style>body{font:16px system-ui;background:#f4f7fb;color:#20304a;display:grid;place-items:center;height:95vh}main{max-width:540px;padding:40px;background:white;border-radius:20px;box-shadow:0 12px 60px #20304a12}h1{font-size:26px}p{line-height:1.9;color:#607086}code{background:#f4f7fb;padding:3px 6px}</style><main><h1>后台暂未连接</h1><p>本窗口会自动重试。后台就绪后即可进入界面，无需等待历史报告扫描。</p><p>如果您已停止或禁用 <code>LiziService</code>，桌面不会自行重新启用它。请管理员在 Windows 服务中检查其状态；异常信息可从托盘菜单“后台日志位置”查阅。</p><p>关闭桌面窗口不会停止已经运行的后台服务。</p></main></html>`;
 
+async function refreshShellAfterUpgrade() {
+  const marker = join(app.getPath("userData"), "desktop-shell-version");
+  let previous = "";
+  try {
+    previous = await readFile(marker, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (previous === app.getVersion()) return;
+  // Do not discard the offline shell while the local backend is unavailable.
+  try {
+    const response = await fetch(`${origin}/api/health`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!response.ok || (await response.json()).ok !== true) return;
+  } catch {
+    return;
+  }
+  // Only application-shell caches are invalidated. IndexedDB reports, settings,
+  // credentials and the service's persistent data are deliberately untouched.
+  // A failure must not block the window: the marker stays unwritten and the
+  // refresh is retried on the next start.
+  try {
+    await window.webContents.session.clearStorageData({
+      origin,
+      storages: ["serviceworkers", "cachestorage"],
+    });
+  } catch (error) {
+    console.error("升级后页面壳缓存更新失败：", error);
+    return;
+  }
+  await mkdir(app.getPath("userData"), { recursive: true });
+  await writeFile(marker, app.getVersion(), "utf8");
+}
+
 async function connect() {
   if (loading || !window || window.isDestroyed() || quitting) return;
   loading = true;
@@ -233,6 +271,7 @@ async function connect() {
       if (!response.ok || (await response.json()).ok !== true)
         throw new Error("后台尚未就绪");
     }
+    await refreshShellAfterUpgrade();
     await window.loadURL(origin);
     waitingForBackend = false;
     clearInterval(retryTimer);
@@ -358,6 +397,35 @@ else {
           await writeFile(preferences, "1", { mode: 0o600 });
         }
       }
+      try {
+        updateManager = await createUpdateManager({
+          app,
+          currentVersion: app.getVersion(),
+        });
+        updateManager.onStatus((value) => {
+          if (window && !window.isDestroyed() && !window.webContents.isDestroyed())
+            window.webContents.send("lizi:update-status", value);
+        });
+      } catch (error) {
+        updateManager = null;
+        updateManagerError = error.message || "更新组件初始化失败";
+        console.error("更新组件初始化失败：", error);
+      }
+      function updateStatus() {
+        return updateManager
+          ? updateManager.getStatus()
+          : {
+              currentVersion: app.getVersion(),
+              state: "error",
+              center: null,
+              latest: null,
+              downloaded: null,
+              progress: null,
+              ready: false,
+              error: updateManagerError,
+              lastCheckedAt: null,
+            };
+      }
       ipcMain.handle("lizi:get-local-admin-token", async (event) => {
         assertTrustedSender(event);
         try {
@@ -379,6 +447,38 @@ else {
       ipcMain.handle("lizi:restore-lan-adapter", (event, parameters) =>
         changeLanAdapter(event, parameters, true),
       );
+      ipcMain.handle("lizi:update-status", (event) => {
+        assertTrustedSender(event);
+        return updateStatus();
+      });
+      ipcMain.handle("lizi:check-update", async (event) => {
+        assertTrustedSender(event);
+        return updateManager ? updateManager.check() : updateStatus();
+      });
+      ipcMain.handle("lizi:download-update", async (event) => {
+        assertTrustedSender(event);
+        return updateManager ? updateManager.download() : updateStatus();
+      });
+      ipcMain.handle("lizi:install-update", async (event) => {
+        assertTrustedSender(event);
+        if (!updateManager) return { ok: false, error: updateManagerError };
+        const result = await updateManager.install();
+        if (result.state === "installing" && !result.error) {
+          // The elevated installer has been accepted by UAC. Give the renderer
+          // a moment to show "正在安装" then quit the desktop so NSIS can
+          // replace files; the background service keeps running until the
+          // installer upgrades it.
+          setTimeout(() => {
+            quitting = true;
+            clearInterval(retryTimer);
+            retryTimer = null;
+            app.quit();
+          }, 900);
+          return { ok: true };
+        }
+        if (result.state === "ready") return { ok: false, cancelled: true };
+        return { ok: false, error: result.error ?? "安装失败" };
+      });
       createWindow();
       tray = new Tray(icon());
       tray.setToolTip("粒子报告 · 后台持续运行");

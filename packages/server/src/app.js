@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { isDate, todayString } from "@lizi/core";
+import { APP_VERSION, INSTRUMENT_TYPES } from "../../core/src/deployment.js";
 import { openDatabase, getSetting, setSetting } from "./database.js";
 import { createDirectoryPolicy, httpError } from "./directories.js";
 import { createAuth, publicUser, requireSameOrigin } from "./auth.js";
@@ -15,6 +16,8 @@ import { FederatedReportStore } from "./federated-reports.js";
 import { exportReports } from "./export.js";
 import { createSyncClient } from "./sync-client.js";
 import { createCloud } from "./cloud.js";
+import { createMobileRead } from "./mobile-read.js";
+import { createReleases } from "./releases.js";
 
 const projectRoot = fileURLToPath(new URL("../../../", import.meta.url));
 async function ensureLocalAdminToken(home) {
@@ -86,11 +89,13 @@ export async function createApplication(options = {}) {
   let lan;
   let sync;
   let cloud;
+  let releases;
   let store;
   try {
     if (isServer) {
       cloud = await createCloud({ home, db, options: options.cloud ?? {} });
       store = cloud.store;
+      releases = await createReleases({ home, auth });
     } else {
       localStore = new ReportStore(db, directories);
       lan = await createLanManager({ home, store: localStore, options: options.lan ?? {} });
@@ -99,6 +104,8 @@ export async function createApplication(options = {}) {
         options: { ...options.sync, deviceId: lan.getSettings().deviceId } });
     }
   } catch (error) {
+    await releases?.close();
+    await cloud?.close();
     await sync?.close();
     await lan?.close();
     await localStore?.close();
@@ -140,6 +147,12 @@ export async function createApplication(options = {}) {
     next();
   });
   if (isServer) app.use("/api/ingest", cloud.machineRouter);
+  if (isServer) {
+    app.use("/api", releases.publicRouter);
+    app.use("/api", releases.uploadRouter);
+    // 只读接口挂在登录守卫之前：调用方是同机的小程序后端，公网由反向代理挡掉。
+    app.use("/api/read", createMobileRead({ store, parseQuery: parseReportQuery }));
+  }
   app.use("/api", requireSameOrigin);
   app.use(express.json({ limit: "1mb", strict: true }));
   app.use("/api", (req, res, next) => {
@@ -169,7 +182,9 @@ export async function createApplication(options = {}) {
     app.post("/api/auth/login", auth.login);
   }
   app.use("/api", auth.guard);
+  app.get("/api/instrument-types", (req, res) => res.json({ types: INSTRUMENT_TYPES }));
   if (isServer) app.use("/api/devices", auth.admin, cloud.adminRouter);
+  if (isServer) app.use("/api/releases", auth.admin, releases.adminRouter);
   if (isServer) {
     app.post("/api/auth/logout", auth.logout);
     app.post("/api/auth/password", auth.changePassword);
@@ -282,7 +297,7 @@ export async function createApplication(options = {}) {
   }
   function status() {
     return {
-      version: "3.0.0",
+      version: APP_VERSION,
       deploymentMode,
       ...store.status(),
       service: {
@@ -448,6 +463,11 @@ export async function createApplication(options = {}) {
     const current = status();
     for (const client of clients) sendEvent(client, "status", current);
   });
+  store.on("devices", (snapshot) => {
+    for (const client of clients) {
+      if (client.req.user?.role === "admin") sendEvent(client, "devices", snapshot);
+    }
+  });
   sync?.on("status", () => {
     for (const client of clients) sendEvent(client, "status", status());
   });
@@ -511,10 +531,12 @@ export async function createApplication(options = {}) {
     localStore,
     sync,
     cloud,
+    releases,
     deploymentMode,
     ready,
     async close() {
       for (const client of clients) client.res.end();
+      await releases?.close();
       await sync?.close();
       await lan?.close();
       if (cloud) await cloud.close();

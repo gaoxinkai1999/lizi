@@ -1,15 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import { shiftBounds } from "@lizi/core";
+import { INSTRUMENT_TYPES } from "../../core/src/deployment.js";
 import { httpError } from "./directories.js";
 import { getSetting, setSetting } from "./database.js";
 
 export const MAX_EVENT_BYTES = 1024 * 1024;
 export const MAX_BATCH_BYTES = 2 * 1024 * 1024;
-export const instrumentAdapters = Object.freeze({
-  strength(report, config) {
-    return { ...report, instrumentId: config.instrumentId, instrumentType: "strength", schemaVersion: 1 };
-  },
-});
+
+// One common protocol/central catalog accommodates future real adapters; only strength is shipped.
+const instrumentTypes = new Map(INSTRUMENT_TYPES.map((type) => [type.id, type]));
+
+export const instrumentAdapters = Object.freeze(Object.fromEntries(
+  INSTRUMENT_TYPES.map((type) => [type.id, (report, config) => ({
+    ...report, instrumentId: config.instrumentId, instrumentType: type.id, schemaVersion: type.schemaVersion,
+  })]),
+));
 
 export function validateBackfillRange(input) {
   const { from, to } = input ?? {};
@@ -51,8 +56,10 @@ export function readSyncConfig(db) {
 // Must run inside the same transaction as the local report write.
 export function enqueueReport(db, reportId, json, historical = false) {
   const config = readSyncConfig(db);
-  if (!config?.configured) return false;
-  const report = instrumentAdapters[config.instrumentType](JSON.parse(json), config);
+  const type = config && instrumentTypes.get(config.instrumentType);
+  const adapter = config && instrumentAdapters[config.instrumentType];
+  if (!config?.configured || !config.instrumentId || !type || !adapter) return false;
+  const report = adapter(JSON.parse(json), config);
   const contentHash = createHash("sha256").update(JSON.stringify(report)).digest("hex");
   const previous = db.prepare("SELECT sequence,content_hash FROM sync_versions WHERE report_id=?").get(reportId);
   if (previous?.content_hash === contentHash) return false;
@@ -60,8 +67,8 @@ export function enqueueReport(db, reportId, json, historical = false) {
   if (!Number.isSafeInteger(sequence)) throw new Error("报告上传版本已超出安全范围");
   const now = new Date().toISOString();
   const event = { eventId: randomUUID(), reportId, sequence, contentHash,
-    instrumentId: config.instrumentId, instrumentType: config.instrumentType,
-    schemaVersion: 1, parserVersion: 2, occurredAt: now, historical, report };
+    instrumentId: config.instrumentId, instrumentType: type.id,
+    schemaVersion: type.schemaVersion, parserVersion: type.parserVersion, occurredAt: now, historical, report };
   const payload = JSON.stringify(event);
   db.prepare(`INSERT INTO sync_versions VALUES(?,?,?) ON CONFLICT(report_id)
     DO UPDATE SET sequence=excluded.sequence,content_hash=excluded.content_hash`).run(reportId, sequence, contentHash);

@@ -8,6 +8,7 @@ import {
   FileSearch,
 } from "lucide-vue-next";
 import { localDate, request, saveBlob, showValue } from "../api.js";
+import { currentShift } from "../../../../packages/core/src/current-shift.js";
 import { readReportPage, saveReportPage, pageKey } from "../offline-cache.js";
 import { createReportImages } from "../report-images.js";
 import Modal from "./Modal.vue";
@@ -30,6 +31,12 @@ function requestQuery(snapshot) {
   return { ...snapshot, clientId };
 }
 const emit = defineEmits(["query-changed"]);
+function chooseCurrentShift() {
+  const current = currentShift();
+  const unchanged = query.date === current.date && query.shift === current.shift && query.page === 1;
+  Object.assign(query, current, { page: 1 });
+  if (unchanged) loadReports();
+}
 const query = reactive({
   date: props.initialQuery?.date || props.today || localDate(),
   shift: props.initialQuery?.shift || "day",
@@ -598,6 +605,7 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
+      <button class="current-shift-button" @click="chooseCurrentShift" title="按北京时间选择当前生产日期与班次">当前班次</button>
       <button
         class="query-refresh"
         :aria-label="loading ? '查询中' : '刷新报告'"

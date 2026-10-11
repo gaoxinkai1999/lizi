@@ -6,7 +6,9 @@ const server = runtime.app.listen(runtime.port, host, () => {
   console.log(`粒子报告${runtime.deploymentMode === "server" ? "服务器" : "客户端后台"}已启动 http://${host}:${runtime.port}`);
   console.log(`持久数据目录：${runtime.home}`);
 });
-server.requestTimeout = 30000;
+// Center releases stream up to 512 MiB; a 30-second total request deadline
+// aborts healthy uploads. Header and upload-idle limits still apply.
+server.requestTimeout = runtime.deploymentMode === "server" ? 15 * 60 * 1000 : 30000;
 server.headersTimeout = 15000;
 server.keepAliveTimeout = 5000;
 runtime.ready.catch(async (error) => {

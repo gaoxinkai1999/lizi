@@ -4,7 +4,8 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
-import { decodeReport, parseReport, shiftBounds } from "@lizi/core";
+import { shiftBounds } from "@lizi/core";
+import { instrumentFileAdapter } from "../../core/src/instruments.js";
 import { getSetting, setSetting, transaction } from "./database.js";
 import { httpError, isWithin } from "./directories.js";
 import { initializeOutbox, enqueueReport, readSyncConfig, validateBackfillRange } from "./sync-outbox.js";
@@ -328,6 +329,7 @@ function activate(query) {
 async function scanScope(scope, target) {
   const version = rootVersion;
   const scanRoot = root;
+  const adapter = instrumentFileAdapter(readSyncConfig(db)?.instrumentType ?? "strength");
   const scanGeneration = ++generation;
   for (const file of scanErrors.keys()) {
     if (file === target || file.startsWith(`${target}${path.sep}`)) scanErrors.delete(file);
@@ -450,7 +452,7 @@ async function scanScope(scope, target) {
       }
       if (!current(scope, version)) return;
       progress.parsed += 1;
-      const report = parseReport(decodeReport(buffer));
+      const report = adapter.parse(buffer);
       report.id = createHash("sha256")
         .update(`${scanRoot}\0${path.relative(scanRoot, file)}`)
         .digest("hex")

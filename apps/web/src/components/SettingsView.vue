@@ -6,22 +6,19 @@ import {
   ChevronRight,
   ArrowUp,
   Server,
-  ShieldCheck,
 } from "lucide-vue-next";
 import { request } from "../api.js";
 import Modal from "./Modal.vue";
 import LanSettings from "./LanSettings.vue";
 import CloudSettings from "./CloudSettings.vue";
+import ClientUpdates from "./ClientUpdates.vue";
 const props = defineProps({
   user: Object,
   status: Object,
   statusError: String,
   deploymentMode: String,
 });
-const emit = defineEmits([
-  "refresh-status",
-  "reports-changed",
-]);
+const emit = defineEmits(["refresh-status", "reports-changed"]);
 const admin = computed(() => props.user?.role === "admin");
 const server = computed(() => props.deploymentMode === "server");
 const settings = ref(null);
@@ -98,10 +95,9 @@ async function browse(path = "") {
   directoryController = new AbortController();
   const sequence = ++directorySequence;
   try {
-    const result = await request(
-      `/directories?${new URLSearchParams({ path })}`,
-      { signal: directoryController.signal },
-    );
+    const result = await request(`/directories?${new URLSearchParams({ path })}`, {
+      signal: directoryController.signal,
+    });
     if (sequence === directorySequence) {
       directory.value = result;
       directoryPath.value = result.path;
@@ -132,11 +128,11 @@ onUnmounted(() => {
     <div class="page-heading">
       <div>
         <p class="eyebrow">{{ admin ? "SETTINGS" : "SERVICE" }}</p>
-        <h1>{{ admin ? "系统设置" : "服务状态" }}</h1>
+        <h1>{{ admin ? "设置" : "服务状态" }}</h1>
         <p class="muted">
           {{
             admin
-              ? "管理报告来源与中心服务器同步。"
+              ? "配置本机仪器接入、报告来源与桌面版本更新。"
               : "查看数据服务与上传连接的实际状态。"
           }}
         </p>
@@ -151,24 +147,89 @@ onUnmounted(() => {
     </div>
     <p v-if="error" class="error-message" role="alert">{{ error }}</p>
     <p v-if="success" class="success-message" role="status">{{ success }}</p>
-    <section v-if="admin && server" class="settings-section">
-      <div class="section-heading">
-        <ShieldCheck :size="21" />
-        <div>
-          <h2>访问鉴权</h2>
-          <p>已开启 · 需要登录</p>
-        </div>
+
+    <CloudSettings
+      v-if="!server"
+      :deployment-mode="deploymentMode"
+      :user="user"
+      :sync-status="status?.sync"
+      @refresh-status="emit('refresh-status')"
+    />
+    <ClientUpdates v-if="!server" />
+
+    <template v-if="admin && !server">
+      <p v-if="loading && !settings" class="notice">正在读取配置…</p>
+      <div v-if="loadError" class="error-message" role="alert">
+        {{ loadError }} <button @click="loadSettings">重新读取设置</button>
       </div>
-      <p class="muted">
-        中心服务器必须登录，账户与权限在账户页管理。
-      </p>
-    </section>
+      <section v-if="settings" class="settings-section">
+        <div class="section-heading">
+          <FolderOpen :size="21" />
+          <div>
+            <h2>报告目录</h2>
+            <p>
+              请选择包含 YYYY-MM-DD
+              日期子目录的根目录，不是某一天的目录。原始文件不会被修改或删除。
+            </p>
+          </div>
+        </div>
+        <form class="form-stack" @submit.prevent="saveDirectory">
+          <label
+            >数据目录
+            <div class="input-action">
+              <input
+                v-model="dataPath"
+                required
+                placeholder="选择报告所在的目录"
+              /><button
+                type="button"
+                :disabled="!!busy"
+                @click="browse(dataPath)"
+              >
+                <FolderOpen :size="18" />浏览
+              </button>
+            </div></label
+          >
+          <details class="allowed-roots">
+            <summary>允许访问的目录范围</summary>
+            <ul>
+              <li v-for="root in settings.allowedRoots" :key="root">
+                {{ root }}
+              </li>
+            </ul>
+          </details>
+          <div class="button-row">
+            <button class="primary" :disabled="!!busy">
+              {{ busy === "path" ? "保存中…" : "保存目录" }}</button
+            ><button
+              type="button"
+              :disabled="!!busy || status?.scanning"
+              @click="scan"
+            >
+              <RefreshCw
+                :size="17"
+                :class="{ spinning: busy === 'scan' }"
+              />{{
+                busy === "scan" || status?.scanning ? "扫描中…" : "重新扫描"
+              }}
+            </button>
+          </div>
+        </form>
+      </section>
+    </template>
+
     <section class="settings-section">
       <div class="section-heading">
         <Server :size="21" />
         <div>
           <h2>服务状态</h2>
-          <p>{{ server ? "显示中心服务器已收到的数据；客户端离线或积压时，报告可能不完整。" : "本地查询按所选日期准备数据；开启上传后会在后台独立采集与补传。" }}</p>
+          <p>
+            {{
+              server
+                ? "显示中心服务器已收到的数据；客户端离线或积压时，报告可能不完整。"
+                : "本地查询按所选日期准备数据；接入中心后会在后台独立采集与补传。"
+            }}
+          </p>
         </div>
       </div>
       <p v-if="statusError" class="error-message" role="alert">
@@ -177,8 +238,9 @@ onUnmounted(() => {
       <p v-if="!status" class="muted">
         {{ statusError ? "暂时无法获取状态。" : "正在读取服务状态…" }}
       </p>
-      <template v-else
-        ><dl class="status-grid">
+      <details v-else class="service-diagnostics">
+        <summary>展开服务与扫描诊断</summary>
+        <dl class="status-grid">
           <div v-if="!server">
             <dt>目录监控</dt>
             <dd>
@@ -234,74 +296,12 @@ onUnmounted(() => {
               <p>{{ item.message }}</p>
             </li>
           </ul>
-        </details></template
-      >
+        </details>
+      </details>
     </section>
-    <CloudSettings :deployment-mode="deploymentMode" :user="user" :sync-status="status?.sync" />
+
     <LanSettings v-if="!server && props.user" />
-    <template v-if="admin && !server"
-      ><p v-if="loading && !settings" class="notice">正在读取配置…</p>
-      <div v-if="loadError" class="error-message" role="alert">
-        {{ loadError }} <button @click="loadSettings">重新读取设置</button>
-      </div>
-      <template v-if="settings"
-        ><section class="settings-section">
-          <div class="section-heading">
-            <FolderOpen :size="21" />
-            <div>
-              <h2>报告目录</h2>
-              <p>
-                请选择包含 YYYY-MM-DD
-                日期子目录的根目录，不是某一天的目录。查询按日期读取，上传会在后台采集与补传；原始文件不会被修改或删除。
-              </p>
-            </div>
-          </div>
-          <form class="form-stack" @submit.prevent="saveDirectory">
-            <label
-              >数据目录
-              <div class="input-action">
-                <input
-                  v-model="dataPath"
-                  required
-                  placeholder="选择报告所在的目录"
-                /><button
-                  type="button"
-                  :disabled="!!busy"
-                  @click="browse(dataPath)"
-                >
-                  <FolderOpen :size="18" />浏览
-                </button>
-              </div></label
-            >
-            <details class="allowed-roots">
-              <summary>允许访问的目录范围</summary>
-              <ul>
-                <li v-for="root in settings.allowedRoots" :key="root">
-                  {{ root }}
-                </li>
-              </ul>
-            </details>
-            <div class="button-row">
-              <button class="primary" :disabled="!!busy">
-                {{ busy === "path" ? "保存中…" : "保存目录" }}</button
-              ><button
-                type="button"
-                :disabled="!!busy || status?.scanning"
-                @click="scan"
-              >
-                <RefreshCw
-                  :size="17"
-                  :class="{ spinning: busy === 'scan' }"
-                />{{
-                  busy === "scan" || status?.scanning ? "扫描中…" : "重新扫描"
-                }}
-              </button>
-            </div>
-          </form>
-        </section>
-        </template
-      ></template
-    >
+
     <Modal
       v-if="!server && directoryOpen"
       title="选择报告目录"
@@ -367,3 +367,12 @@ onUnmounted(() => {
     >
   </section>
 </template>
+
+<style scoped>
+.service-diagnostics > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #455e71;
+  padding: 4px 0 10px;
+}
+</style>

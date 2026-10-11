@@ -8,6 +8,7 @@ import path from "node:path";
 import http from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { parseReport } from "@lizi/core";
+import { APP_VERSION, CENTER_URL } from "../../core/src/deployment.js";
 import { openDatabase, getSetting, setSetting, transaction } from "../src/database.js";
 import { createDirectoryPolicy } from "../src/directories.js";
 import { ReportStore } from "../src/reports.js";
@@ -34,47 +35,61 @@ function ack(body, events = body.events) {
     acknowledgements: events.map(({ eventId, reportId, sequence, contentHash }) => ({ eventId, reportId, sequence, contentHash })) };
 }
 
-async function serverFixture(t, handler, heartbeatHandler) {
+function respond(response, body) {
+  response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+}
+
+// Enrollment is a first-class ingest route; by default the center approves immediately.
+async function serverFixture(t, reportHandler, heartbeatHandler, enrollHandler) {
+  const enrolls = [];
   const server = http.createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const raw = Buffer.concat(chunks);
-    const body = JSON.parse(raw.toString());
-    if (request.url.endsWith("/heartbeat")) {
-      if (heartbeatHandler) return heartbeatHandler({ request, response, body });
-      response.writeHead(200, { "content-type": "application/json" }).end("{}");
+    let body = null;
+    try { body = JSON.parse(raw.toString()); } catch { body = null; }
+    const auth = /^Bearer (.+)$/.exec(request.headers.authorization ?? "")?.[1] ?? null;
+    if (request.url.endsWith("/enroll")) {
+      enrolls.push({ body, auth });
+      if (enrollHandler) return enrollHandler({ request, response, body, auth });
+      respond(response, { protocolVersion: 1, deviceId: body?.deviceId, registrationState: "approved" });
       return;
     }
-    handler({ request, response, body, bytes: raw.length });
+    if (request.url.endsWith("/heartbeat")) {
+      if (heartbeatHandler) return heartbeatHandler({ request, response, body, auth });
+      respond(response, {});
+      return;
+    }
+    reportHandler({ request, response, body, bytes: raw.length });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(async () => {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   });
-  return `http://127.0.0.1:${server.address().port}`;
+  return { url: `http://127.0.0.1:${server.address().port}`, enrolls };
 }
 
-async function fixture(t, serverUrl, realStore = false, configure = true) {
+async function fixture(t, centerUrl, { realStore = false, configure = true } = {}) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "lizi-sync-"));
   const root = path.join(home, "reports");
   await fs.mkdir(root);
   let db = openDatabase(home);
   setSetting(db, "dataPath", root);
   const policy = await createDirectoryPolicy(home, JSON.stringify([root]));
+  const deviceId = randomUUID();
   let store;
   let client;
-  const deviceId = randomUUID();
   async function open() {
     store = realStore ? new ReportStore(db, policy) : Object.assign(new EventEmitter(), {
-      syncConfigure: async () => {}, close: async () => {}, status: () => ({ errors: [] }),
+      syncConfigure: async () => {}, close: async () => {}, status: () => ({ errors: [] }), failure: null, root,
     });
     if (realStore) await store.start();
-    client = await createSyncClient({ home, db, localStore: store, options: { allowLoopbackHttp: true, deviceId } });
+    client = await createSyncClient({ home, db, localStore: store,
+      options: { centerUrl, allowLoopbackHttp: true, deviceId } });
   }
   await open();
-  if (configure)
-    await client.configure({ enabled: false, serverUrl, token: "device-secret", instrumentId: "strength-1", instrumentType: "strength" });
+  if (configure) await client.configure({ instrumentId: "A01", instrumentType: "strength" });
   t.after(async () => {
     await client.close();
     await store.close();
@@ -84,8 +99,8 @@ async function fixture(t, serverUrl, realStore = false, configure = true) {
   return {
     home, root, deviceId,
     get db() { return db; }, get store() { return store; }, get client() { return client; },
-    enqueue(id, sample) {
-      transaction(db, () => enqueueReport(db, id, JSON.stringify(parseReport(text(sample)))));
+    enqueue(id, sample, historical = false) {
+      transaction(db, () => enqueueReport(db, id, JSON.stringify(parseReport(text(sample))), historical));
     },
     async restart() {
       await client.close();
@@ -104,10 +119,6 @@ async function stableWrite(file, content) {
   await fs.utimes(file, older, older);
 }
 
-function respond(response, body) {
-  response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
-}
-
 test("URL policy rejects insecure endpoints and credentials, normalizes duplicate slashes", () => {
   assert.equal(normalizeServerUrl("https://EXAMPLE.com//base///"), "https://example.com/base");
   for (const url of ["http://example.com", "http://127.0.0.1", "https://a/#", "https://a/?", "https://user:pass@a", "ftp://a"])
@@ -115,10 +126,65 @@ test("URL policy rejects insecure endpoints and credentials, normalizes duplicat
   assert.equal(normalizeServerUrl("http://127.0.0.1:1234/", true), "http://127.0.0.1:1234");
 });
 
+test("saving type and short ID enrolls automatically; approval uploads with no manual token", async (t) => {
+  const batches = [];
+  let enrollState = "pending";
+  const { url, enrolls } = await serverFixture(t,
+    ({ response, body }) => { batches.push(body); respond(response, ack(body)); },
+    undefined,
+    ({ response, body }) => response.writeHead(202, { "content-type": "application/json" })
+      .end(JSON.stringify({ protocolVersion: 1, deviceId: body.deviceId, registrationState: enrollState })));
+  const f = await fixture(t, url);
+  const settings = f.client.getSettings();
+  assert.deepEqual(Object.keys(settings).sort(), ["centerUrl", "configured", "identityLocked", "instrumentId", "instrumentType"]);
+  assert.equal(settings.instrumentId, "A01");
+  assert.equal(settings.instrumentType, "strength");
+  assert.equal(settings.configured, true);
+  assert.equal(settings.identityLocked, false);
+  assert.equal(settings.centerUrl, url);
+  const saved = JSON.parse(await fs.readFile(path.join(f.home, "sync-credentials.json"), "utf8"));
+  assert.match(saved.secret, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(saved.deviceId, f.deviceId);
+  assert.equal(saved.centerUrl, url);
+  f.enqueue("a", "one");
+  await f.client.start();
+  await until(() => f.client.getStatus().registrationState === "pending" && enrolls.length >= 1);
+  assert.equal(batches.length, 0);
+  assert.equal(f.client.getStatus().pending, 1);
+  assert.match(enrolls[0].auth, /^[A-Za-z0-9_-]{43}$/);
+  assert.deepEqual(enrolls[0].body, { protocolVersion: 1, deviceId: f.deviceId, instrumentId: "A01",
+    instrumentType: "strength", clientVersion: APP_VERSION });
+  enrollState = "approved";
+  await f.client.retry();
+  await until(() => f.client.getStatus().pending === 0);
+  assert.equal(batches[0].deviceId, f.deviceId);
+  // The device secret that enrolled is the same one that authenticates uploads.
+  assert.ok(enrolls.every((entry) => entry.auth === enrolls[0].auth));
+});
+
+test("legacy URL/token/enable/device inputs and unknown instrument types are rejected", async (t) => {
+  const { url } = await serverFixture(t, ({ response, body }) => respond(response, ack(body)));
+  const f = await fixture(t, url);
+  for (const input of [{ serverUrl: "https://x.example" }, { token: "x" }, { enabled: true }, { deviceId: randomUUID() }])
+    await assert.rejects(f.client.configure(input), { status: 400 });
+  await assert.rejects(f.client.configure({ instrumentType: "imaginary" }), { status: 400 });
+  await assert.rejects(f.client.configure({ instrumentId: "no spaces!" }), { status: 400 });
+  await assert.rejects(f.client.configure({ instrumentId: "" }), { status: 400 });
+});
+
+test("instrument identity locks after events are generated", async (t) => {
+  const { url } = await serverFixture(t, ({ response, body }) => respond(response, ack(body)));
+  const f = await fixture(t, url);
+  f.enqueue("a", "one");
+  await assert.rejects(f.client.configure({ instrumentId: "B02" }), { status: 409 });
+  assert.equal(f.client.getSettings().instrumentId, "A01");
+  assert.equal(f.client.getSettings().identityLocked, true);
+});
+
 test("lost response replays durable identical event after restart and exact acknowledgement drains", async (t) => {
   const requests = [];
   let acknowledge = false;
-  const url = await serverFixture(t, ({ request, response, body }) => {
+  const { url } = await serverFixture(t, ({ request, response, body }) => {
     requests.push(body);
     if (!acknowledge) request.socket.destroy();
     else respond(response, ack(body));
@@ -126,7 +192,6 @@ test("lost response replays durable identical event after restart and exact ackn
   const f = await fixture(t, url);
   f.enqueue("report-a", "first");
   const original = f.db.prepare("SELECT * FROM sync_outbox").get();
-  await f.client.configure({ enabled: true });
   await f.client.start();
   await until(() => f.client.getStatus().nextAttemptAt);
   const nextAttemptAt = f.client.getStatus().nextAttemptAt;
@@ -146,10 +211,9 @@ test("lost response replays durable identical event after restart and exact ackn
 
 test("new revision during inflight and malformed acknowledgement cannot delete another event", async (t) => {
   let held;
-  const url = await serverFixture(t, (request) => { held = request; });
+  const { url } = await serverFixture(t, (request) => { held = request; });
   const f = await fixture(t, url);
   f.enqueue("report-a", "first");
-  await f.client.configure({ enabled: true });
   await f.client.start();
   await until(() => held);
   f.enqueue("report-a", "second");
@@ -170,14 +234,12 @@ test("new revision during inflight and malformed acknowledgement cannot delete a
 
 test("partial exact acknowledgements remove only committed events; wrong device and duplicates remove none", async (t) => {
   let held;
-  const url = await serverFixture(t, (request) => { held = request; });
+  const { url } = await serverFixture(t, (request) => { held = request; });
   const f = await fixture(t, url);
   f.enqueue("a", "one"); f.enqueue("b", "two");
-  await f.client.configure({ enabled: true });
   await f.client.start();
   await until(() => held);
-  const response = ack(held.body, [held.body.events[0]]);
-  respond(held.response, response);
+  respond(held.response, ack(held.body, [held.body.events[0]]));
   await until(() => f.client.getStatus().pending === 1 && f.client.getStatus().nextAttemptAt);
   for (const corrupt of [
     (body) => ({ ...ack(body), deviceId: randomUUID() }),
@@ -193,51 +255,159 @@ test("partial exact acknowledgements remove only committed events; wrong device 
   }
 });
 
-test("authorization errors pause durably; disabled queue and endpoint/identity changes are safe", async (t) => {
-  let accepted = false;
-  let calls = 0;
-  const url = await serverFixture(t, ({ response, body }) => {
-    calls += 1;
-    if (accepted) respond(response, ack(body));
-    else response.writeHead(401).end();
-  });
+test("revoked devices keep their queue and resume with the same credential after re-approval", async (t) => {
+  const batches = [];
+  let enrollState = "approved";
+  const { url, enrolls } = await serverFixture(t, ({ request, response, body }) => {
+    if (enrollState === "revoked") { response.writeHead(401).end(); return; }
+    batches.push(body);
+    respond(response, ack(body));
+  }, undefined, ({ response, body }) => respond(response,
+    { protocolVersion: 1, deviceId: body.deviceId, registrationState: enrollState }));
   const f = await fixture(t, url);
   f.enqueue("a", "one");
-  await assert.rejects(f.client.configure({ serverUrl: "https://another.example" }), { status: 409 });
-  await assert.rejects(f.client.configure({ instrumentId: "changed" }), { status: 409 });
-  await assert.rejects(f.client.configure({ instrumentType: "imaginary" }), { status: 400 });
-  await f.client.configure({ enabled: true });
   await f.client.start();
-  await until(() => f.client.getStatus().paused);
-  assert.match(f.client.getStatus().lastError, /令牌/);
-  await f.restart();
-  assert.equal(f.client.getStatus().paused, true);
-  assert.equal(calls, 1);
-  await f.client.configure({ enabled: false });
-  f.enqueue("b", "while-disabled");
-  await f.client.start();
-  assert.equal(f.client.getStatus().pending, 2);
-  assert.equal(calls, 1);
-  accepted = true;
-  await f.client.configure({ enabled: true, token: "rotated-token" });
   await until(() => f.client.getStatus().pending === 0);
-  assert.equal(JSON.stringify(f.client.getSettings()).includes("rotated-token"), false);
-  await f.client.configure({ serverUrl: "https://another.example", token: "new-token", enabled: false });
-  assert.equal(f.client.getSettings().serverUrl, "https://another.example");
+  const secret = enrolls[0].auth;
+  enrollState = "revoked";
+  f.enqueue("b", "two");
+  await f.client.retry();
+  await until(() => f.client.getStatus().registrationState === "revoked");
+  assert.equal(f.client.getStatus().pending, 1);
+  const delivered = batches.length;
+  await f.client.retry();
+  await delay(120);
+  assert.equal(f.client.getStatus().registrationState, "revoked");
+  assert.equal(f.client.getStatus().pending, 1);
+  assert.equal(batches.length, delivered);
+  enrollState = "approved";
+  await f.client.retry();
+  await until(() => f.client.getStatus().pending === 0);
+  assert.equal(f.client.getStatus().registrationState, "approved");
+  assert.ok(enrolls.every((entry) => entry.auth === secret));
+});
+
+test("authorization failure from enrollment is a visible permanent error that preserves the queue", async (t) => {
+  const batches = [];
+  const { url } = await serverFixture(t,
+    ({ response, body }) => { batches.push(body); respond(response, ack(body)); },
+    undefined, ({ response }) => response.writeHead(401).end());
+  const f = await fixture(t, url);
+  f.enqueue("a", "retained");
+  await f.client.start();
+  await until(() => f.client.getStatus().paused && /重新登记/.test(f.client.getStatus().lastError ?? ""));
+  assert.equal(f.client.getStatus().pending, 1);
+  await f.restart();
+  await f.client.start();
+  await delay(120);
+  assert.equal(f.client.getStatus().paused, true);
+  assert.equal(f.client.getStatus().pending, 1);
+  assert.equal(batches.length, 0);
+});
+
+test("a duplicate short ID stays retryable and keeps the queue instead of stopping", async (t) => {
+  let calls = 0;
+  const { url } = await serverFixture(t, ({ response, body }) => respond(response, ack(body)),
+    undefined, ({ response }) => { calls += 1; response.writeHead(409).end(); });
+  const f = await fixture(t, url);
+  f.enqueue("a", "one");
+  await f.client.start();
+  await until(() => calls >= 1 && /编号/.test(f.client.getStatus().lastError ?? ""));
+  assert.equal(f.client.getStatus().paused, false);
+  assert.equal(f.client.getStatus().registrationState, "pending");
+  assert.equal(f.client.getStatus().pending, 1);
+  await f.client.retry();
+  await until(() => calls >= 2);
+});
+
+test("legacy fixed endpoint with pending reports is refused and never retargeted", async (t) => {
+  const batches = [];
+  const { url, enrolls } = await serverFixture(t, ({ response, body }) => { batches.push(body); respond(response, ack(body)); });
+  const f = await fixture(t, url);
+  await f.client.close();
+  f.enqueue("late", "late");
+  setSetting(f.db, "syncConfig", JSON.stringify({ enabled: true, serverUrl: "https://old.example", deviceId: f.deviceId,
+    token: "legacy-token", instrumentId: "A01", instrumentType: "strength", configured: true }));
+  await fs.writeFile(path.join(f.home, "sync-credentials.json"),
+    JSON.stringify({ serverUrl: "https://old.example", deviceId: f.deviceId, token: "legacy-token" }));
+  await f.restart();
+  assert.equal(f.client.getSettings().configured, true);
+  await f.client.start();
+  await delay(150);
+  assert.equal(f.client.getStatus().paused, true);
+  assert.equal(f.client.getStatus().pending, 1);
+  assert.equal(batches.length, 0);
+  assert.equal(enrolls.length, 0);
+  // The refusal must survive repeated restarts, not only the process that detected it.
+  await f.restart();
+  await f.client.start();
+  await delay(150);
+  assert.equal(f.client.getStatus().paused, true);
+  assert.equal(f.client.getStatus().pending, 1);
+  assert.equal(batches.length, 0);
+  assert.equal(enrolls.length, 0);
+  await assert.rejects(f.client.configure({ instrumentId: "A01", instrumentType: "strength" }), { status: 409 });
+  await delay(80);
+  assert.equal(batches.length, 0);
+  assert.equal(f.client.getStatus().pending, 1);
+  const credentials = JSON.parse(await fs.readFile(path.join(f.home, "sync-credentials.json"), "utf8"));
+  assert.equal(credentials.secret, undefined);
+});
+
+test("3.0 token credentials aimed at the fixed center are reused as the device secret", async (t) => {
+  const { url, enrolls } = await serverFixture(t, ({ response, body }) => respond(response, ack(body)));
+  const f = await fixture(t, url, { configure: false });
+  const token = "T".repeat(43);
+  setSetting(f.db, "syncConfig", JSON.stringify({ enabled: true, serverUrl: CENTER_URL, deviceId: f.deviceId,
+    token, instrumentId: "", instrumentType: "strength", configured: false }));
+  await fs.writeFile(path.join(f.home, "sync-credentials.json"),
+    JSON.stringify({ serverUrl: CENTER_URL, deviceId: f.deviceId, token }));
+  await f.restart();
+  await f.client.configure({ instrumentId: "A01", instrumentType: "strength" });
+  await f.client.start();
+  await until(() => enrolls.length >= 1);
+  assert.equal(enrolls[0].auth, token);
+  const credentials = JSON.parse(await fs.readFile(path.join(f.home, "sync-credentials.json"), "utf8"));
+  assert.equal(credentials.secret, token);
+  assert.equal(credentials.centerUrl, url);
+});
+
+test("legacy endpoint migration re-baselines only after the queue is drained", async (t) => {
+  const received = [];
+  const { url } = await serverFixture(t, ({ response, body }) => { received.push(...body.events); respond(response, ack(body)); });
+  const f = await fixture(t, url, { realStore: true });
+  const file = path.join(f.root, today(), "instrument", "existing.txt");
+  await stableWrite(file, text("existing"));
+  await until(() => f.db.prepare("SELECT id FROM reports WHERE path=?").get(file));
+  await until(() => f.client.getStatus().pending === 1);
+  const baseline = JSON.parse(f.db.prepare("SELECT payload FROM sync_outbox").get().payload);
+  await f.client.start();
+  await until(() => f.client.getStatus().pending === 0);
+  await f.client.close();
+  setSetting(f.db, "syncConfig", JSON.stringify({ enabled: true, serverUrl: "https://old.example", deviceId: f.deviceId,
+    token: "legacy-token", instrumentId: "A01", instrumentType: "strength", configured: true }));
+  await f.restart();
+  await f.client.start();
+  await until(() => received.some((event) => event.reportId === baseline.reportId && event.sequence === baseline.sequence + 1));
+  const replacement = received.find((event) => event.reportId === baseline.reportId && event.sequence === baseline.sequence + 1);
+  assert.equal(replacement.contentHash, baseline.contentHash);
+  assert.notEqual(replacement.eventId, baseline.eventId);
+  assert.equal(received[0].reportId, baseline.reportId);
+  await until(() => f.client.getStatus().pending === 0);
+  assert.equal(f.client.getStatus().lastError, null);
 });
 
 test("large offline backlog sends bounded batches and shutdown cancels a stalled request", async (t) => {
   const batches = [];
   let hold = true;
   let held;
-  const url = await serverFixture(t, (request) => {
+  const { url } = await serverFixture(t, (request) => {
     batches.push(request);
     if (hold) held = request;
     else respond(request.response, ack(request.body));
   });
   const f = await fixture(t, url);
   for (let index = 0; index < 80; index += 1) f.enqueue(`report-${index}`, `${index}-${"x".repeat(70000)}`);
-  await f.client.configure({ enabled: true });
   await f.client.start();
   await until(() => held);
   const beforeClose = Date.now();
@@ -248,7 +418,7 @@ test("large offline backlog sends bounded batches and shutdown cancels a stalled
   hold = false;
   await f.client.start();
   await until(() => f.client.getStatus().pending === 0);
-  assert.ok(batches.length >= 4);
+  assert.ok(batches.length >= 3);
   for (const batch of batches) {
     assert.ok(batch.body.events.length <= 32);
     assert.ok(batch.bytes <= 2 * 1024 * 1024);
@@ -256,8 +426,8 @@ test("large offline backlog sends bounded batches and shutdown cancels a stalled
 });
 
 test("background acquisition without browser queries catches downtime and preserves deleted source payloads", async (t) => {
-  const url = await serverFixture(t, ({ request }) => request.socket.destroy());
-  const f = await fixture(t, url, true);
+  const { url } = await serverFixture(t, ({ request }) => request.socket.destroy());
+  const f = await fixture(t, url, { realStore: true });
   await f.client.start();
   const first = path.join(f.root, today(), "instrument", "first.txt");
   await stableWrite(first, text("first"));
@@ -278,20 +448,47 @@ test("background acquisition without browser queries catches downtime and preser
     "all days beyond active scope limit must finish their contiguous checkpoint");
   assert.equal(getSetting(f.db, key), today());
   assert.equal(f.db.prepare("SELECT COUNT(*) AS count FROM reports").get().count, 8);
-  assert.equal(f.client.getSettings().enabled, false);
+  assert.equal(f.client.getSettings().configured, true);
+});
+
+test("offline enrollment keeps local acquisition working and separates registration from upload errors", async (t) => {
+  let online = false;
+  const { url, enrolls } = await serverFixture(t,
+    ({ request, response, body }) => { if (!online) request.socket.destroy(); else respond(response, ack(body)); },
+    undefined,
+    ({ request, response, body }) => {
+      if (!online) { request.socket.destroy(); return; }
+      respond(response, { protocolVersion: 1, deviceId: body.deviceId, registrationState: "approved" });
+    });
+  const f = await fixture(t, url, { realStore: true });
+  await f.client.start();
+  const file = path.join(f.root, today(), "instrument", "offline.txt");
+  await stableWrite(file, text("offline"));
+  await until(() => f.client.getStatus().pending === 1);
+  const status = f.client.getStatus();
+  assert.equal(status.registrationState, "pending");
+  assert.equal(status.paused, false);
+  assert.equal(status.acquisitionError, null);
+  assert.match(status.lastError, /网络不可用|登记/);
+  assert.ok(f.db.prepare("SELECT id FROM reports WHERE path=?").get(file));
+  assert.ok(enrolls.length >= 1);
+  online = true;
+  await f.client.retry();
+  await until(() => f.client.getStatus().pending === 0);
+  assert.equal(f.client.getStatus().registrationState, "approved");
 });
 
 test("queue storage failure rolls back report fingerprint; repaired disk and modified malformed files retry", async (t) => {
-  const url = await serverFixture(t, ({ request }) => request.socket.destroy());
-  const f = await fixture(t, url, true);
+  const { url } = await serverFixture(t, ({ request }) => request.socket.destroy());
+  const f = await fixture(t, url, { realStore: true });
   await f.client.start();
   f.db.exec("CREATE TRIGGER reject_outbox BEFORE INSERT ON sync_outbox BEGIN SELECT RAISE(ABORT, 'disk unavailable'); END;");
   const file = path.join(f.root, today(), "instrument", "disk.txt");
   await stableWrite(file, text("disk"));
-  await until(() => f.store.status().errors.some((error) => error.message.includes("disk unavailable")));
+  await until(() => f.store.status().errors.some((error) => /disk unavailable/.test(error.message)));
   assert.equal(f.db.prepare("SELECT id FROM reports WHERE path=?").get(file), undefined);
   assert.equal(f.db.prepare("SELECT fingerprint FROM report_files WHERE path=?").get(file), undefined);
-  assert.match(f.client.getStatus().lastError, /采集/);
+  assert.match(f.client.getStatus().acquisitionError, /disk unavailable/);
   f.db.exec("DROP TRIGGER reject_outbox");
   await f.store.scan();
   await until(() => f.client.getStatus().pending === 1);
@@ -304,35 +501,37 @@ test("queue storage failure rolls back report fingerprint; repaired disk and mod
   await until(() => f.client.getStatus().pending === 2);
 });
 
-test("failed heartbeat cannot block uploads and successful heartbeat cannot discard a failed upload", async (t) => {
+test("failed heartbeat cannot block uploads and carries clientVersion with a separate acquisitionError", async (t) => {
   let heartbeatFails = true;
   let uploadFails = false;
-  let heartbeats = 0;
-  const url = await serverFixture(t, ({ request, response, body }) => {
+  const heartbeats = [];
+  const { url } = await serverFixture(t, ({ request, response, body }) => {
     if (uploadFails) request.socket.destroy();
     else respond(response, ack(body));
-  }, ({ request, response }) => {
-    heartbeats += 1;
+  }, ({ request, response, body }) => {
+    heartbeats.push(body);
     if (heartbeatFails) request.socket.destroy();
     else respond(response, {});
   });
   const f = await fixture(t, url);
   f.enqueue("a", "one");
-  await f.client.configure({ enabled: true });
   await f.client.start();
-  await until(() => f.client.getStatus().pending === 0 && heartbeats === 1);
+  await until(() => f.client.getStatus().pending === 0 && heartbeats.length >= 1);
   heartbeatFails = false;
   uploadFails = true;
   f.enqueue("b", "two");
   await f.client.retry();
-  await until(() => heartbeats === 2 && f.client.getStatus().nextAttemptAt);
+  await until(() => heartbeats.length >= 2 && f.client.getStatus().nextAttemptAt);
   assert.equal(f.client.getStatus().pending, 1);
   assert.match(f.client.getStatus().lastError, /网络/);
+  assert.equal(heartbeats[0].clientVersion, APP_VERSION);
+  assert.ok("acquisitionError" in heartbeats[0]);
+  assert.equal(heartbeats[0].acquisitionError, null);
 });
 
 test("explicit historical date range survives restart and marks historical reports without a query", async (t) => {
-  const url = await serverFixture(t, ({ request }) => request.socket.destroy());
-  const f = await fixture(t, url, true);
+  const { url } = await serverFixture(t, ({ request }) => request.socket.destroy());
+  const f = await fixture(t, url, { realStore: true });
   await f.client.start();
   const from = "2020-01-01";
   const to = "2020-01-03";
@@ -351,64 +550,72 @@ test("explicit historical date range survives restart and marks historical repor
   const events = f.db.prepare("SELECT payload FROM sync_outbox").all().map((row) => JSON.parse(row.payload));
   assert.deepEqual(events.map((event) => event.report.date).sort(), [from, "2020-01-02", to]);
   assert.ok(events.every((event) => event.historical));
-  assert.equal(f.client.getSettings().enabled, false);
-});
-
-test("already parsed local records become historical baseline and drained endpoint switch re-baselines without resetting sequence", async (t) => {
-  const received = [];
-  const url = await serverFixture(t, ({ response, body }) => { received.push(...body.events); respond(response, ack(body)); });
-  const f = await fixture(t, url, true, false);
-  const file = path.join(f.root, today(), "instrument", "existing.txt");
-  await stableWrite(file, text("before-configuration"));
-  await until(() => f.db.prepare("SELECT id FROM reports WHERE path=?").get(file));
-  assert.equal(f.client.getStatus().pending, 0);
-  await f.client.configure({ enabled: false, serverUrl: url, token: "device-secret", instrumentId: "strength-1" });
-  await until(() => f.client.getStatus().pending === 1);
-  const baseline = JSON.parse(f.db.prepare("SELECT payload FROM sync_outbox").get().payload);
-  assert.equal(baseline.historical, true);
-  await f.client.configure({ enabled: true });
-  await f.client.start();
-  await until(() => f.client.getStatus().pending === 0);
-  await f.client.configure({ enabled: false, serverUrl: `${url}/another-server`, token: "new-token" });
-  await until(() => f.client.getStatus().pending === 1);
-  const replacement = JSON.parse(f.db.prepare("SELECT payload FROM sync_outbox").get().payload);
-  assert.equal(replacement.sequence, baseline.sequence + 1);
-  assert.equal(replacement.contentHash, baseline.contentHash);
-  assert.notEqual(replacement.eventId, baseline.eventId);
-  assert.equal(received[0].reportId, baseline.reportId);
+  assert.equal(f.client.getSettings().configured, true);
 });
 
 test("missing or mismatched credentials remain visibly paused until repaired", async (t) => {
-  const url = await serverFixture(t, ({ response, body }) => respond(response, ack(body)));
+  const { url } = await serverFixture(t, ({ response, body }) => respond(response, ack(body)));
   const f = await fixture(t, url);
   f.enqueue("a", "retained");
-  await f.client.configure({ enabled: true });
   await fs.unlink(path.join(f.home, "sync-credentials.json"));
   await f.restart();
-  assert.equal(f.client.getSettings().tokenConfigured, false);
+  assert.equal(f.client.getSettings().configured, true);
   assert.equal(f.client.getStatus().paused, true);
-  assert.match(f.client.getStatus().lastError, /凭据缺失/);
+  assert.match(f.client.getStatus().lastError, /凭据/);
   await f.client.start();
   await f.client.retry();
   assert.equal(f.client.getStatus().paused, true);
   assert.equal(f.client.getStatus().pending, 1);
   await fs.writeFile(path.join(f.home, "sync-credentials.json"), JSON.stringify({
-    token: "wrong-target-secret", deviceId: f.deviceId, serverUrl: "https://another.example",
+    secret: "A".repeat(43), deviceId: f.deviceId, centerUrl: "https://another.example",
   }));
   await f.restart();
-  assert.equal(f.client.getSettings().tokenConfigured, false);
   assert.equal(f.client.getStatus().paused, true);
-  await f.client.configure({ token: "repaired-secret" });
+  assert.match(f.client.getStatus().lastError, /凭据/);
+  await f.client.configure({ instrumentId: "A01", instrumentType: "strength" });
   await f.client.start();
   await until(() => f.client.getStatus().pending === 0);
+  assert.equal(f.client.getStatus().registrationState, "approved");
+});
+
+test("an unconfigured client registers nothing until instrument type and ID are saved", async (t) => {
+  const { url, enrolls } = await serverFixture(t, ({ response, body }) => respond(response, ack(body)));
+  const f = await fixture(t, url, { configure: false });
+  await f.client.start();
+  await delay(120);
+  assert.equal(f.client.getSettings().configured, false);
+  assert.equal(f.client.getStatus().registrationState, "unconfigured");
+  assert.equal(enrolls.length, 0);
+  await f.client.configure({ instrumentId: "A01", instrumentType: "strength" });
+  await until(() => enrolls.length >= 1);
+  assert.equal(f.client.getStatus().registrationState, "approved");
+});
+
+test("configured clients without a report directory surface it through acquisitionError", async (t) => {
+  const heartbeats = [];
+  const { url } = await serverFixture(t, ({ response, body }) => respond(response, ack(body)),
+    ({ response, body }) => { heartbeats.push(body); respond(response, {}); });
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "lizi-sync-"));
+  const db = openDatabase(home);
+  const store = Object.assign(new EventEmitter(), {
+    syncConfigure: async () => {}, close: async () => {}, status: () => ({ errors: [] }), failure: null, root: "",
+  });
+  const deviceId = randomUUID();
+  const client = await createSyncClient({ home, db, localStore: store,
+    options: { centerUrl: url, allowLoopbackHttp: true, deviceId } });
+  t.after(async () => { await client.close(); db.close(); await fs.rm(home, { recursive: true, force: true }); });
+  await client.configure({ instrumentId: "A01", instrumentType: "strength" });
+  assert.equal(client.getStatus().acquisitionError, "尚未设置报告目录");
+  await client.start();
+  await until(() => heartbeats.length >= 1);
+  assert.equal(heartbeats[0].acquisitionError, "尚未设置报告目录");
 });
 
 test("ACK persistence and metric read failures retain event and recover without rejecting background work", async (t) => {
   let held;
-  const url = await serverFixture(t, (request) => { held = request; });
+  const { url } = await serverFixture(t, (request) => { held = request; });
   const f = await fixture(t, url);
   f.enqueue("a", "durable");
-  await f.client.configure({ enabled: true });
   await f.client.start();
   await until(() => held);
   assert.equal(f.client.getStatus().pending, 1);

@@ -2,7 +2,9 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   Activity,
+  Cpu,
   FileChartColumn,
+  Package,
   Settings2,
   UsersRound,
   LogOut,
@@ -19,6 +21,8 @@ import {
 import AuthView from "./components/AuthView.vue";
 import ReportsView from "./components/ReportsView.vue";
 import SettingsView from "./components/SettingsView.vue";
+import DevicesView from "./components/DevicesView.vue";
+import ReleasesView from "./components/ReleasesView.vue";
 import AccountsView from "./components/AccountsView.vue";
 const ready = ref(false);
 const bootError = ref("");
@@ -52,22 +56,26 @@ let revision = null;
 let invalidating = false;
 let retryAt = 0;
 let failures = 0;
-const nav = computed(() => [
-  { id: "reports", label: "报告", icon: FileChartColumn },
-  {
-    id: "settings",
-    label:
-      !server.value || user.value?.role === "admin"
-        ? "设置"
-        : "状态",
-    icon: Settings2,
-  },
-  ...(server.value
-    ? [{ id: "accounts", label: "账户", icon: UsersRound }]
-    : []),
-]);
+const nav = computed(() => {
+  if (server.value) {
+    const items = [{ id: "reports", label: "报告", icon: FileChartColumn }];
+    if (user.value?.role === "admin") {
+      items.push({ id: "devices", label: "仪器", icon: Cpu });
+      items.push({ id: "releases", label: "版本", icon: Package });
+    }
+    items.push({ id: "accounts", label: "账户", icon: UsersRound });
+    return items;
+  }
+  return [
+    { id: "reports", label: "报告", icon: FileChartColumn },
+    { id: "settings", label: "设置", icon: Settings2 },
+  ];
+});
 watch(page, () => window.scrollTo({ top: 0, behavior: "instant" }), {
   flush: "post",
+});
+watch(nav, (items) => {
+  if (!items.some((item) => item.id === page.value)) page.value = "reports";
 });
 function acceptRevision(value) {
   if (value === undefined || value === null || value === revision) return;
@@ -470,13 +478,27 @@ onUnmounted(() => {
           :live="live"
         />
         <SettingsView
-          v-if="page === 'settings' && verified && user"
+          v-if="page === 'settings' && verified && user && !server"
           :user="user"
           :deployment-mode="deploymentMode"
           :status="status"
           :status-error="statusError"
           @refresh-status="loadStatus"
           @reports-changed="refreshKey++"
+        />
+        <DevicesView
+          v-if="
+            server && page === 'devices' && verified && user?.role === 'admin'
+          "
+          :user="user"
+          @refresh-status="loadStatus"
+        />
+        <ReleasesView
+          v-if="
+            server && page === 'releases' && verified && user?.role === 'admin'
+          "
+          :user="user"
+          @refresh-status="loadStatus"
         />
         <AccountsView
           v-if="server && page === 'accounts' && verified && user"
@@ -485,9 +507,9 @@ onUnmounted(() => {
           @user-changed="refreshState"
         />
         <section v-if="page !== 'reports' && !verified" class="state-panel">
-          <h2>{{ page === "accounts" ? "账户" : "设置与状态" }}需要在线验证</h2>
+          <h2>{{ nav.find((item) => item.id === page)?.label || "此页" }}需要在线验证</h2>
           <p>
-            此页不保存离线副本。为避免误操作，离线时不显示配置或账户信息，也不能提交修改。
+            此页不保存离线副本。为避免误操作，离线时不显示配置或管理信息，也不能提交修改。
           </p>
           <button @click="boot">重新连接</button>
         </section>

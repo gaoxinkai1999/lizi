@@ -298,6 +298,48 @@ label {
   color: #51716e;
   background: #eef5f3;
 }
+.dev-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.dev-state::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #9aa5b3;
+  flex-shrink: 0;
+}
+.dev-state.online::before {
+  background: #4c9b7b;
+}
+.dev-state.unstable::before,
+.dev-state.pending::before {
+  background: #d99a3d;
+}
+.dev-state.offline::before,
+.dev-state.revoked::before {
+  background: #c05a4d;
+}
+.dev-state.online {
+  color: #2f6d54;
+  background: #eef5f0;
+}
+.dev-state.unstable,
+.dev-state.pending {
+  color: #8b6a1f;
+  background: #faf3e2;
+}
+.dev-state.offline,
+.dev-state.revoked {
+  color: #9b4139;
+  background: #fbeeeb;
+}
 .source-badge {
   background: #eef3f8;
   color: #53667a;
@@ -621,6 +663,10 @@ label {
 .query-refresh {
   margin-left: auto;
   min-height: 46px;
+}
+.current-shift-button {
+  min-height: 46px;
+  white-space: nowrap;
 }
 .query-caption {
   display: flex;
@@ -2155,6 +2201,12 @@ td:last-child {
   padding: 6px 10px;
   font-size: 12px;
 }
+.reports-page--table-first .current-shift-button {
+  min-height: 36px;
+  padding: 6px 12px;
+  font-size: 12px;
+  white-space: nowrap;
+}
 .reports-page--table-first .results-toolbar {
   flex-wrap: wrap;
   gap: 6px 12px;
@@ -2261,6 +2313,13 @@ td:last-child {
     grid-row: 1;
     min-height: 44px;
     margin: 0;
+  }
+  .reports-page--table-first .current-shift-button {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    min-height: 40px;
+    margin: 0;
+    white-space: nowrap;
   }
   .reports-page--table-first .results-toolbar button,
   .reports-page--table-first .pagination button,

@@ -1,26 +1,39 @@
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import { getSetting, setSetting, transaction } from "./database.js";
 import { httpError } from "./directories.js";
-import { initializeOutbox, readSyncConfig, instrumentAdapters, validateBackfillRange, MAX_EVENT_BYTES, MAX_BATCH_BYTES } from "./sync-outbox.js";
+import { CENTER_URL, APP_VERSION, INSTRUMENT_TYPES, normalizeInstrumentId } from "../../core/src/deployment.js";
+import { initializeOutbox, readSyncConfig, validateBackfillRange, MAX_EVENT_BYTES, MAX_BATCH_BYTES } from "./sync-outbox.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SECRET = /^[A-Za-z0-9_-]{43}$/;
+const AUTH_STATUS = new Set([401, 403]);
 const PERMANENT = new Set([400, 401, 403, 404, 405, 409, 413, 415, 422]);
+// Enrollment keeps a bounded, visible retry for conflicts/limits/rate caps; only a rejected
+// credential stops it. An admin can free a duplicate short ID, so 409 must remain retryable.
+const ENROLL_PERMANENT = new Set([400, 404, 405, 415, 422]);
+const REGISTRATION_STATES = new Set(["unconfigured", "pending", "approved", "revoked"]);
+const INSTRUMENT_TYPE_IDS = new Set(INSTRUMENT_TYPES.map((type) => type.id));
+// 3.0 forms no longer exist: server URL, token, enable toggle and physical device ID are never user input.
+const LEGACY_INPUT_KEYS = ["serverUrl", "token", "enabled", "deviceId"];
+const CREDENTIALS_ERROR = "上传凭据缺失或与当前中心不匹配，请在设置中重新保存";
+const LEGACY_ENDPOINT_ERROR = "旧上传服务器仍有未上传报告，已停止向新中心自动迁移；请先处理旧服务器的积压报告（本版本不支持在设置中解除）";
 const MAX_DELAY = 300000;
+const ENROLL_POLL_MS = 30000;
 
 export function normalizeServerUrl(value, allowLoopbackHttp = false) {
   if (!value) return "";
   let url;
-  try { url = new URL(value); } catch { throw httpError(400, "服务器地址无效"); }
+  try { url = new URL(value); } catch { throw httpError(400, "中心地址无效"); }
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
   if (url.protocol !== "https:" && !(allowLoopbackHttp && url.protocol === "http:" && loopback))
-    throw httpError(400, "上传服务器必须使用 HTTPS");
+    throw httpError(400, "中心地址必须使用 HTTPS");
   if (url.username || url.password || url.search || url.hash || /[?#]/.test(value))
-    throw httpError(400, "服务器地址不能包含账号、查询参数或片段");
+    throw httpError(400, "中心地址不能包含账号、查询参数或片段");
   url.pathname = url.pathname.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
   return url.toString().replace(/\/+$/, "");
 }
@@ -46,6 +59,12 @@ function retryAfter(value) {
   return Number.isFinite(delay) ? Math.min(MAX_DELAY, Math.max(0, delay)) : 0;
 }
 
+function errorMessage(error) {
+  if (!error) return null;
+  if (typeof error === "string") return error;
+  return error.message ?? String(error);
+}
+
 class SyncClient extends EventEmitter {
   constructor({ home, db, localStore, options }) {
     super();
@@ -54,47 +73,159 @@ class SyncClient extends EventEmitter {
     this.options = options;
     this.credentialsPath = path.join(home, "sync-credentials.json");
     initializeOutbox(db);
-    this.config = readSyncConfig(db) ?? { enabled: false, serverUrl: "", deviceId: options.deviceId ?? randomUUID(),
-      instrumentId: options.deviceId ?? "", instrumentType: "strength", configured: false };
-    if (!this.config.instrumentId) this.config.instrumentId = this.config.deviceId;
-    if (!UUID.test(this.config.deviceId) || (options.deviceId && options.deviceId !== this.config.deviceId))
+    // Fixed mainland center; only test harnesses may inject an alternate loopback URL.
+    this.centerUrl = normalizeServerUrl(options.centerUrl ?? CENTER_URL, options.allowLoopbackHttp);
+    const stored = readSyncConfig(db);
+    const deviceId = stored?.deviceId ?? options.deviceId ?? randomUUID();
+    if (!UUID.test(deviceId) || (options.deviceId && options.deviceId !== deviceId))
       throw httpError(409, "上传设备标识必须与本地设备标识一致");
-    normalizeServerUrl(this.config.serverUrl, options.allowLoopbackHttp);
+    const identityLocked = getSetting(db, "syncIdentityLocked") === "true";
+    this.config = this.migrateConfig(stored, deviceId, identityLocked);
+    this.legacyEndpoint = this.detectLegacyEndpoint(stored) || getSetting(db, "syncLegacyEndpoint", "");
+    if (this.legacyEndpoint === CENTER_URL) this.legacyEndpoint = "";
+    // The block marker is durable until the old backlog is truly drained; rewriting the internal
+    // config (which drops the old serverUrl) must not make a later restart forget the refusal.
+    this.legacyBlocked = Boolean(this.legacyEndpoint) &&
+      Boolean(db.prepare("SELECT 1 FROM sync_outbox LIMIT 1").get());
+    setSetting(db, "syncLegacyEndpoint", this.legacyBlocked ? this.legacyEndpoint : "");
     setSetting(db, "syncConfig", JSON.stringify(this.config));
-    this.credentials = null;
-    try {
-      this.credentials = JSON.parse(fs.readFileSync(this.credentialsPath, "utf8"));
-      fs.chmodSync(this.credentialsPath, 0o600);
-    } catch {
-      // A missing/unreadable secret must stop uploading, not local acquisition.
-      this.credentials = null;
-    }
-    this.state = JSON.parse(getSetting(db, "syncState", "null")) ?? {
-      lastSuccessAt: null, nextAttemptAt: null, lastError: null, paused: false, attempts: 0,
-    };
-    if (this.config.enabled && !this.token()) {
-      this.state.lastError = "无法读取设备令牌，请重新保存上传凭据";
+    this.credentials = this.loadCredentials();
+    this.credentialError = null;
+    // Adopting the fixed center is safe only when the old queue is already drained; re-baseline then.
+    if (this.legacyEndpoint && !this.legacyBlocked) db.exec("UPDATE sync_versions SET content_hash=''");
+    this.state = this.loadState();
+    this.migrateCredentials();
+    if (this.legacyBlocked) {
       this.state.paused = true;
-      this.state.authFailed = true;
+      this.state.lastError = LEGACY_ENDPOINT_ERROR;
+    } else if (this.config.configured && !this.secret()) {
+      this.state.paused = true;
+      this.state.lastError = this.credentialError ?? CREDENTIALS_ERROR;
     }
     this.connected = false;
     this.requests = new Set();
     this.generation = 0;
     this.closed = false;
     this.started = false;
+    this.flight = null;
+    this.enrollFlight = null;
+    this.heartbeatFlight = null;
     this.queueMetrics = { pending: null, oldestPendingAt: null, backfillPendingDays: null };
     this.onLocalStatus = () => this.emitStatus();
     this.onRevision = () => { this.emitStatus(); this.kick(); };
   }
 
-  token() {
-    return this.credentials?.serverUrl === this.config.serverUrl && this.credentials?.deviceId === this.config.deviceId
-      ? this.credentials.token : "";
+  migrateConfig(stored, deviceId, identityLocked) {
+    const config = { deviceId, instrumentId: "", instrumentType: "strength", configured: false };
+    if (!stored || typeof stored !== "object") return config;
+    config.instrumentType = INSTRUMENT_TYPE_IDS.has(stored.instrumentType) ? stored.instrumentType : "strength";
+    let instrumentId = typeof stored.instrumentId === "string" ? stored.instrumentId : "";
+    if (identityLocked) {
+      // A locked identity is never rewritten, even when a legacy value is not a short ID.
+    } else {
+      try { instrumentId = normalizeInstrumentId(instrumentId); } catch { instrumentId = ""; }
+    }
+    config.instrumentId = instrumentId;
+    config.configured = Boolean(stored.configured) && Boolean(instrumentId) &&
+      INSTRUMENT_TYPE_IDS.has(config.instrumentType);
+    return config;
+  }
+
+  detectLegacyEndpoint(stored) {
+    if (!stored || typeof stored !== "object" || typeof stored.serverUrl !== "string" || !stored.serverUrl) return "";
+    let normalized;
+    try { normalized = normalizeServerUrl(stored.serverUrl, this.options.allowLoopbackHttp); } catch { return stored.serverUrl; }
+    return normalized && normalized !== CENTER_URL ? normalized : "";
+  }
+
+  loadCredentials() {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.credentialsPath, "utf8"));
+      fs.chmodSync(this.credentialsPath, 0o600);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      // A missing/unreadable secret must stop uploading, not local acquisition.
+      return null;
+    }
+  }
+
+  loadState() {
+    let stored = null;
+    try { stored = JSON.parse(getSetting(this.db, "syncState", "null")); } catch { stored = null; }
+    const state = {
+      lastSuccessAt: null, nextAttemptAt: null, lastError: null, paused: false, attempts: 0,
+      registrationState: this.config.configured ? "pending" : "unconfigured", enrollNextAt: null, enrollAttempts: 0,
+    };
+    if (stored && typeof stored === "object") Object.assign(state, stored);
+    if (!REGISTRATION_STATES.has(state.registrationState))
+      state.registrationState = this.config.configured ? "pending" : "unconfigured";
+    if (!this.config.configured) state.registrationState = "unconfigured";
+    return state;
+  }
+
+  // Migration only rewrites an existing 3.0 credential file, and only when the file has no
+  // centerUrl of its own: a mismatched current-schema file must stay visible until re-saved.
+  migrateCredentials() {
+    if (this.legacyBlocked || !this.config.configured || this.secret()) return;
+    const credentials = this.credentials;
+    if (!credentials || credentials.deviceId !== this.config.deviceId || "centerUrl" in credentials) return;
+    const token = typeof credentials.token === "string" && SECRET.test(credentials.token) ? credentials.token : "";
+    const sameTarget = !this.legacyEndpoint || this.legacyEndpoint === CENTER_URL;
+    let candidate = null;
+    // The center still holds the 3.0 token hash, so a same-center token must be reused verbatim.
+    // Only a drained, different former target may receive a freshly generated secret.
+    if (token && sameTarget) candidate = { centerUrl: this.centerUrl, deviceId: this.config.deviceId, secret: token };
+    else if (!sameTarget) candidate = this.issueCredentials();
+    if (!candidate) return;
+    try { this.writeCredentials(candidate); }
+    catch { this.credentialError = "无法安全保存上传凭据，请检查磁盘空间和权限"; }
+  }
+
+  // Explicit re-save may repair any credential: reuse a valid secret or 3.0 token, else issue one.
+  adoptableCredentials() {
+    const credentials = this.credentials;
+    if (credentials && credentials.deviceId === this.config.deviceId) {
+      if (SECRET.test(credentials.secret ?? ""))
+        return { centerUrl: this.centerUrl, deviceId: this.config.deviceId, secret: credentials.secret };
+      const token = typeof credentials.token === "string" && SECRET.test(credentials.token) ? credentials.token : "";
+      if (token && (!this.legacyEndpoint || this.legacyEndpoint === CENTER_URL))
+        return { centerUrl: this.centerUrl, deviceId: this.config.deviceId, secret: token };
+    }
+    return this.issueCredentials();
+  }
+
+  issueCredentials() {
+    return { centerUrl: this.centerUrl, deviceId: this.config.deviceId, secret: randomBytes(32).toString("base64url") };
+  }
+
+  secret() {
+    const credentials = this.credentials;
+    return credentials && credentials.deviceId === this.config.deviceId &&
+      credentials.centerUrl === this.centerUrl && SECRET.test(credentials.secret ?? "")
+      ? credentials.secret : "";
   }
 
   getSettings() {
-    const { enabled, serverUrl, deviceId, instrumentId, instrumentType } = this.config;
-    return { enabled, serverUrl, deviceId, tokenConfigured: Boolean(this.token()), instrumentId, instrumentType };
+    return {
+      instrumentId: this.config.instrumentId,
+      instrumentType: this.config.instrumentType,
+      configured: this.config.configured,
+      identityLocked: getSetting(this.db, "syncIdentityLocked") === "true",
+      centerUrl: this.centerUrl,
+    };
+  }
+
+  acquisitionError() {
+    const failure = errorMessage(this.localStore.failure);
+    if (failure) return failure;
+    const first = this.localStore.status?.().errors?.[0];
+    const reported = errorMessage(first);
+    if (reported) return reported;
+    // Configured but no source directory: the center must not see a healthy client that can never collect.
+    const root = this.localStore.root;
+    if (this.config.configured && (root === "" || root === null || root === undefined))
+      return "尚未设置报告目录";
+    return null;
   }
 
   getStatus() {
@@ -105,19 +236,33 @@ class SyncClient extends EventEmitter {
     } catch {
       queueMetricsStale = true;
       this.connected = false;
-      this.state.paused = true;
-      this.state.lastError = "上传队列读取失败，请检查磁盘空间和权限；显示最后已知队列状态";
     }
-    if (this.config.enabled && !this.token()) {
-      this.state.lastError = "上传凭据缺失或与当前服务器不匹配，请重新保存设备令牌";
-      this.state.paused = true;
-      this.state.authFailed = true;
+    const acquisitionError = this.acquisitionError();
+    const missingSecret = this.config.configured && !this.secret() && !this.legacyBlocked;
+    let lastError = this.state.lastError;
+    let paused = this.state.paused;
+    if (this.legacyBlocked) { lastError = LEGACY_ENDPOINT_ERROR; paused = true; }
+    else if (missingSecret) { lastError = this.credentialError ?? CREDENTIALS_ERROR; paused = true; }
+    if (queueMetricsStale) {
+      lastError = "上传队列读取失败，请检查磁盘空间和权限；显示最后已知队列状态";
+      paused = true;
     }
-    const acquisitionError = this.localStore.failure || this.localStore.status?.().errors?.[0];
-    return { enabled: this.config.enabled, connected: this.connected, ...this.queueMetrics, queueMetricsStale,
-      lastSuccessAt: this.state.lastSuccessAt, nextAttemptAt: this.state.nextAttemptAt,
-      lastError: this.state.lastError ?? (acquisitionError ? "本地采集异常，请检查目录权限、磁盘空间和报告索引状态" : null),
-      paused: this.state.paused };
+    return {
+      configured: this.config.configured,
+      connected: this.connected,
+      registrationState: this.config.configured ? this.state.registrationState : "unconfigured",
+      clientVersion: APP_VERSION,
+      pending: this.queueMetrics.pending,
+      oldestPendingAt: this.queueMetrics.oldestPendingAt,
+      backfillPendingDays: this.queueMetrics.backfillPendingDays,
+      queueMetricsStale,
+      lastSuccessAt: this.state.lastSuccessAt,
+      nextAttemptAt: this.state.nextAttemptAt,
+      lastError,
+      acquisitionError,
+      paused,
+      attempts: this.state.attempts,
+    };
   }
 
   emitStatus() { if (!this.closed) this.emit("status", this.getStatus()); }
@@ -144,54 +289,55 @@ class SyncClient extends EventEmitter {
 
   async configure(input) {
     if (this.closed) throw httpError(503, "上传服务已关闭");
+    // A legacy endpoint with an undrained queue must never be retargeted onto the fixed center,
+    // not even by an explicit settings save. Resolution of that backlog is a separate, explicit step.
+    if (this.legacyBlocked) throw httpError(409, LEGACY_ENDPOINT_ERROR);
     if (!input || typeof input !== "object" || Array.isArray(input)) throw httpError(400, "上传设置无效");
-    const next = { ...this.config };
-    if (input.enabled !== undefined) {
-      if (typeof input.enabled !== "boolean") throw httpError(400, "启用状态无效");
-      next.enabled = input.enabled;
+    for (const key of LEGACY_INPUT_KEYS)
+      if (input[key] !== undefined)
+        throw httpError(400, "上传服务器、设备令牌与启用开关由系统统一管理，不再支持手工设置");
+    let instrumentId = this.config.instrumentId;
+    if (input.instrumentId !== undefined) {
+      if (typeof input.instrumentId !== "string") throw httpError(400, "仪器编号无效");
+      try { instrumentId = normalizeInstrumentId(input.instrumentId); }
+      catch (error) { throw httpError(400, error.message); }
     }
-    if (input.serverUrl !== undefined) {
-      if (typeof input.serverUrl !== "string") throw httpError(400, "服务器地址无效");
-      next.serverUrl = normalizeServerUrl(input.serverUrl, this.options.allowLoopbackHttp);
+    if (!instrumentId) throw httpError(400, "请输入仪器编号");
+    let instrumentType = this.config.instrumentType;
+    if (input.instrumentType !== undefined) {
+      if (typeof input.instrumentType !== "string" || !INSTRUMENT_TYPE_IDS.has(input.instrumentType))
+        throw httpError(400, "目前仅支持强力仪 strength");
+      instrumentType = input.instrumentType;
     }
-    if (input.deviceId !== undefined && input.deviceId !== this.config.deviceId)
-      throw httpError(409, "设备标识不可更改，请在服务器登记此设备标识");
-    if (input.instrumentId !== undefined) next.instrumentId = input.instrumentId;
-    if (typeof next.instrumentId !== "string" || !next.instrumentId.trim() || next.instrumentId.length > 128 || /[\x00-\x1f\x7f]/.test(next.instrumentId))
-      throw httpError(400, "仪器标识必须为 1–128 个有效字符");
-    if (input.instrumentType !== undefined) next.instrumentType = input.instrumentType;
-    if (!Object.hasOwn(instrumentAdapters, next.instrumentType)) throw httpError(400, "目前仅支持强力仪 strength");
-    if (input.token !== undefined && (typeof input.token !== "string" || input.token.length > 4096 || /[\s\x00-\x1f\x7f]/.test(input.token)))
-      throw httpError(400, "设备令牌无效");
-    const endpointChanged = next.serverUrl !== this.config.serverUrl;
-    const token = input.token || (!endpointChanged ? this.token() : "");
-    if (next.enabled && (!next.serverUrl || !token)) throw httpError(400, "启用上传前请配置服务器和设备令牌");
-    next.configured = this.config.configured || Boolean(next.serverUrl && token);
+    const identityLocked = getSetting(this.db, "syncIdentityLocked") === "true";
+    if (identityLocked && instrumentId !== this.config.instrumentId)
+      throw httpError(409, "已有上传记录，仪器编号不可更改");
+    const identityChanged = instrumentId !== this.config.instrumentId || instrumentType !== this.config.instrumentType;
+    const next = { ...this.config, instrumentId, instrumentType, configured: true };
+    const fresh = this.secret() ? null : this.adoptableCredentials();
     const previousCredentials = this.credentials;
-    const credentials = { serverUrl: next.serverUrl, deviceId: next.deviceId, token };
     let wroteCredentials = false;
     try {
       transaction(this.db, () => {
-        if (endpointChanged && this.db.prepare("SELECT 1 FROM sync_outbox LIMIT 1").get())
-          throw httpError(409, "队列尚未排空，不能更换上传服务器；请先恢复原服务器并完成上传");
-        if (getSetting(this.db, "syncIdentityLocked") === "true" && next.instrumentId !== this.config.instrumentId)
-          throw httpError(409, "已有上传记录，仪器标识不可更改");
-        this.writeCredentials(credentials);
-        wroteCredentials = true;
+        if (fresh) { this.writeCredentials(fresh); this.credentials = fresh; wroteCredentials = true; }
         setSetting(this.db, "syncConfig", JSON.stringify(next));
-        if (endpointChanged) this.db.exec("UPDATE sync_versions SET content_hash=''");
-        setSetting(this.db, "syncState", JSON.stringify({ ...this.state, nextAttemptAt: null, lastError: null, paused: false, authFailed: false, attempts: 0 }));
+        if (identityChanged) this.db.exec("UPDATE sync_versions SET content_hash=''");
+        this.state = { ...this.state, nextAttemptAt: null, lastError: null, paused: false, attempts: 0,
+          registrationState: "pending", enrollNextAt: null, enrollAttempts: 0 };
+        setSetting(this.db, "syncState", JSON.stringify(this.state));
       });
     } catch (error) {
-      if (wroteCredentials) this.writeCredentials(previousCredentials);
+      if (wroteCredentials) {
+        try { this.writeCredentials(previousCredentials); this.credentials = previousCredentials; }
+        catch { /* Credential rollback failure stays visible through the thrown error. */ }
+      }
       throw error;
     }
+    this.credentialError = null;
     this.generation += 1;
     for (const request of this.requests) request.destroy(new Error("configuration changed"));
     this.config = next;
-    this.credentials = credentials;
     this.connected = false;
-    Object.assign(this.state, { nextAttemptAt: null, lastError: null, paused: false, authFailed: false, attempts: 0 });
     await this.localStore.syncConfigure();
     this.emitStatus();
     this.kick();
@@ -218,7 +364,10 @@ class SyncClient extends EventEmitter {
 
   async retry() {
     if (this.closed) throw httpError(503, "上传服务已关闭");
-    Object.assign(this.state, { nextAttemptAt: null, lastError: null, paused: false, authFailed: false, attempts: 0 });
+    Object.assign(this.state, { nextAttemptAt: null, lastError: null, paused: false, attempts: 0,
+      enrollNextAt: null, enrollAttempts: 0 });
+    if (this.config.configured && this.state.registrationState === "unconfigured")
+      this.state.registrationState = "pending";
     this.saveState();
     this.kick();
     this.heartbeat();
@@ -227,22 +376,27 @@ class SyncClient extends EventEmitter {
 
   async backfill(input) {
     if (this.closed) throw httpError(503, "上传服务已关闭");
-    if (!this.config.configured) throw httpError(400, "请先配置上传服务器和设备令牌");
+    if (!this.config.configured) throw httpError(400, "请先保存仪器编号与类型");
     const { from, to } = validateBackfillRange(input);
     const scheduled = await this.localStore.syncBackfill({ from, to });
     this.emitStatus();
     return { ...scheduled, status: this.getStatus() };
   }
 
-  canSend() { return this.started && !this.closed && this.config.enabled && this.config.serverUrl && this.token(); }
+  canSend() {
+    return this.started && !this.closed && this.config.configured &&
+      this.state.registrationState === "approved" && Boolean(this.secret());
+  }
 
   post(route, body) {
     const payload = JSON.stringify(body);
-    const url = new URL(`${this.config.serverUrl}/api/ingest/${route}`);
+    const url = new URL(`${this.centerUrl}/api/ingest/${route}`);
+    const secret = this.secret();
     return new Promise((resolve, reject) => {
+      if (!secret) { reject(httpError(401, "上传凭据缺失")); return; }
       const transport = url.protocol === "https:" ? https : http;
       const request = transport.request(url, { method: "POST", rejectUnauthorized: true,
-        headers: { authorization: `Bearer ${this.token()}`, "content-type": "application/json", "content-length": Buffer.byteLength(payload) } });
+        headers: { authorization: `Bearer ${secret}`, "content-type": "application/json", "content-length": Buffer.byteLength(payload) } });
       this.requests.add(request);
       const timer = setTimeout(() => request.destroy(new Error("request timeout")), 15000);
       timer.unref();
@@ -268,11 +422,9 @@ class SyncClient extends EventEmitter {
     });
   }
 
-  failure(message, permanent = false, minimumDelay = 0, authFailed = false) {
+  failure(message, permanent = false, minimumDelay = 0) {
     this.connected = false;
-    if (!this.state.authFailed || authFailed) this.state.lastError = message;
-    this.state.authFailed = Boolean(this.state.authFailed || authFailed);
-    permanent ||= this.state.authFailed;
+    this.state.lastError = message;
     this.state.paused = permanent;
     this.state.attempts = Math.min(20, this.state.attempts + 1);
     const delay = Math.min(MAX_DELAY, Math.max(minimumDelay,
@@ -281,8 +433,105 @@ class SyncClient extends EventEmitter {
     this.saveState();
   }
 
+  // A rejected credential is not a permanent local state: re-confirm enrollment before deciding.
+  registrationFailed(message) {
+    this.connected = false;
+    if (this.state.registrationState === "approved") this.state.registrationState = "pending";
+    this.state.lastError = message;
+    this.state.paused = false;
+    this.state.enrollNextAt = null;
+    this.saveState();
+    this.kick();
+  }
+
+  permanentEnrollment(message) {
+    this.state.paused = true;
+    this.state.lastError = message;
+    this.state.enrollNextAt = null;
+    this.saveState();
+  }
+
+  scheduleEnrollment(message, minimumDelay = 0) {
+    this.connected = false;
+    this.state.lastError = message;
+    this.state.enrollAttempts = Math.min(20, (this.state.enrollAttempts ?? 0) + 1);
+    const backoff = Math.min(MAX_DELAY, 2000 * 2 ** (this.state.enrollAttempts - 1));
+    const delay = Math.min(MAX_DELAY, Math.max(minimumDelay, backoff * (1 + Math.random() * 0.25)));
+    this.state.enrollNextAt = new Date(Date.now() + delay).toISOString();
+    this.saveState();
+  }
+
+  // Center-side conflicts/limits/rate caps keep the unapproved 30s cadence instead of a long backoff.
+  scheduleEnrollmentRetry(message, minimumDelay = 0) {
+    this.connected = false;
+    this.state.lastError = message;
+    this.state.enrollAttempts = 0;
+    const delay = Math.min(MAX_DELAY, Math.max(minimumDelay, ENROLL_POLL_MS));
+    this.state.enrollNextAt = new Date(Date.now() + delay).toISOString();
+    this.saveState();
+  }
+
+  enrollDue() {
+    return !this.state.enrollNextAt || Date.parse(this.state.enrollNextAt) <= Date.now();
+  }
+
+  enrollIfDue() {
+    if (this.closed || this.enrollFlight || this.legacyBlocked || !this.config.configured) return;
+    if (this.state.registrationState === "approved" || this.state.paused) return;
+    if (!this.secret() || !this.enrollDue()) return;
+    this.enroll();
+  }
+
+  enroll() {
+    const generation = this.generation;
+    const body = { protocolVersion: 1, deviceId: this.config.deviceId, instrumentId: this.config.instrumentId,
+      instrumentType: this.config.instrumentType, clientVersion: APP_VERSION };
+    this.enrollFlight = this.post("enroll", body).then((response) => {
+      if (this.closed || generation !== this.generation) return;
+      this.handleEnrollment(response);
+    }).catch(() => {
+      if (this.closed || generation !== this.generation) return;
+      this.scheduleEnrollment("网络不可用或登记请求超时，报告已保留，稍后自动重试");
+    }).finally(() => { this.enrollFlight = null; });
+  }
+
+  handleEnrollment({ status, body, retryAfter: after }) {
+    const registrationState = body?.registrationState;
+    if ((status === 200 || status === 202) && body?.protocolVersion === 1 &&
+        body.deviceId === this.config.deviceId && REGISTRATION_STATES.has(registrationState)) {
+      this.state.enrollAttempts = 0;
+      this.state.registrationState = registrationState;
+      this.state.lastError = null;
+      if (registrationState === "approved") {
+        Object.assign(this.state, { paused: false, nextAttemptAt: null, enrollNextAt: null });
+      } else {
+        // Pending awaits admin approval; revoked keeps its queue and slow-polls for re-enable.
+        this.state.enrollNextAt = new Date(Date.now() + ENROLL_POLL_MS).toISOString();
+      }
+      this.saveState();
+      if (registrationState === "approved") { this.kick(); this.heartbeat(); }
+      return;
+    }
+    const detail = typeof body?.error === "string" ? body.error : "";
+    if (status === 401) {
+      this.permanentEnrollment(detail || "设备凭据被中心拒绝，可能已被其他设备占用；请联系管理员重新登记");
+      return;
+    }
+    if (ENROLL_PERMANENT.has(status)) {
+      this.permanentEnrollment(`中心拒绝登记（HTTP ${status}）${detail ? `：${detail}` : "，请检查中心版本与登记参数"}`);
+      return;
+    }
+    // Duplicate short ID, size limits, rate caps and server errors stay visible but retryable.
+    this.scheduleEnrollmentRetry(detail || (status === 409
+      ? "该仪器编号已被其他设备占用，或本机已登记且不支持直接更换编号/类型；请联系管理员处理"
+      : `中心登记暂不可用（HTTP ${status}），报告已保留，稍后自动重试`), after);
+  }
+
   kick() {
-    if (!this.canSend() || this.flight || this.state.paused || Date.parse(this.state.nextAttemptAt) > Date.now()) return;
+    if (!this.started || this.closed || this.legacyBlocked || !this.config.configured) return;
+    if (this.state.registrationState !== "approved") { this.enrollIfDue(); return; }
+    if (this.state.paused || this.flight) return;
+    if (Date.parse(this.state.nextAttemptAt) > Date.now()) return;
     this.flight = this.send().catch(() => {
       // Persistence failure must remain visible; never acknowledge in memory only.
       this.connected = false;
@@ -317,16 +566,20 @@ class SyncClient extends EventEmitter {
     }
     if (this.closed || generation !== this.generation) return;
     if (response.status !== 200) {
-      this.failure(response.status === 401 || response.status === 403 ? "设备令牌无效或已撤销，请更新令牌" : `服务器拒绝上传（HTTP ${response.status}），报告已保留`,
-        PERMANENT.has(response.status) || (response.status >= 300 && response.status < 400), response.retryAfter,
-        response.status === 401 || response.status === 403);
+      if (AUTH_STATUS.has(response.status)) {
+        this.registrationFailed(response.body?.error || "设备尚未获批准或登记已失效，正在重新确认登记状态");
+        return;
+      }
+      this.failure(`服务器拒绝上传（HTTP ${response.status}），报告已保留`,
+        PERMANENT.has(response.status) || (response.status >= 300 && response.status < 400), response.retryAfter);
       return;
     }
     const acknowledged = exactAcknowledgements(response.body, this.config.deviceId, events);
     if (!acknowledged.length) { this.failure("服务器确认无效，报告已保留，将以相同事件标识重试"); return; }
     const complete = acknowledged.length === events.length;
     const nextState = { ...this.state, lastSuccessAt: new Date().toISOString(), attempts: 0,
-      nextAttemptAt: null, lastError: this.state.paused ? this.state.lastError : null };
+      nextAttemptAt: null, registrationState: "approved",
+      lastError: this.state.paused ? this.state.lastError : null };
     transaction(this.db, () => {
       const remove = this.db.prepare("DELETE FROM sync_outbox WHERE event_id=? AND report_id=? AND sequence=? AND content_hash=?");
       for (const id of acknowledged) {
@@ -342,16 +595,31 @@ class SyncClient extends EventEmitter {
   }
 
   heartbeat() {
-    if (!this.canSend() || this.heartbeatFlight || this.state.authFailed) return;
+    if (!this.canSend() || this.heartbeatFlight || this.state.paused) return;
     const generation = this.generation;
     const status = this.getStatus();
     if (status.queueMetricsStale) return;
     this.heartbeatFlight = this.post("heartbeat", { protocolVersion: 1, deviceId: this.config.deviceId,
-      pending: status.pending, oldestPendingAt: status.oldestPendingAt, lastError: status.lastError?.slice(0, 256) ?? null })
+      pending: status.pending, oldestPendingAt: status.oldestPendingAt,
+      lastError: status.lastError?.slice(0, 256) ?? null,
+      acquisitionError: status.acquisitionError?.slice(0, 256) ?? null,
+      clientVersion: APP_VERSION })
       .then((response) => {
         if (this.closed || generation !== this.generation) return;
-        if (response.status === 401 || response.status === 403) this.failure("设备令牌无效或已撤销，请更新令牌", true, 0, true);
-        else if (response.status >= 200 && response.status < 300) { this.connected = true; this.emitStatus(); }
+        if (AUTH_STATUS.has(response.status)) {
+          this.registrationFailed(response.body?.error || "设备尚未获批准或登记已失效，正在重新确认登记状态");
+          return;
+        }
+        if (response.status >= 200 && response.status < 300) {
+          const registrationState = response.body?.registrationState;
+          if (REGISTRATION_STATES.has(registrationState) && registrationState !== this.state.registrationState) {
+            this.state.registrationState = registrationState;
+            this.saveState();
+            if (registrationState === "approved") { this.kick(); return; }
+          }
+          this.connected = true;
+          this.emitStatus();
+        }
       }).catch(() => {
         if (!this.closed && generation === this.generation) { this.connected = false; this.emitStatus(); }
       }).finally(() => { this.heartbeatFlight = null; });
@@ -366,7 +634,7 @@ class SyncClient extends EventEmitter {
     this.localStore.off("revision", this.onRevision);
     this.localStore.off("status", this.onLocalStatus);
     for (const request of this.requests) request.destroy(new Error("client closed"));
-    await Promise.allSettled([this.flight, this.heartbeatFlight]);
+    await Promise.allSettled([this.flight, this.heartbeatFlight, this.enrollFlight]);
   }
 }
 

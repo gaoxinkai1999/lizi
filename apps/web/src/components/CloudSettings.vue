@@ -2,85 +2,147 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { CloudUpload, RefreshCw } from "lucide-vue-next";
 import { request } from "../api.js";
-import Modal from "./Modal.vue";
 
-const props = defineProps({ deploymentMode: String, user: Object, syncStatus: Object });
+const props = defineProps({
+  deploymentMode: String,
+  user: Object,
+  syncStatus: Object,
+});
+const emit = defineEmits(["refresh-status"]);
+
 const server = computed(() => props.deploymentMode === "server");
 const admin = computed(() => props.user?.role === "admin");
 const canManage = ref(false);
 const settings = ref(null);
 const status = ref(null);
-const uploadState = computed(() => {
-  if (!status.value?.enabled) return "未启用";
-  if (status.value.paused) return "已暂停，请处理错误后重试";
-  return status.value.connected ? "最近连接成功" : "等待连接或重试";
-});
-const devices = ref([]);
+const types = ref([]);
 const loading = ref(false);
 const loaded = ref(false);
+const stale = ref(false);
 const busy = ref("");
 const error = ref("");
+const typesError = ref("");
 const success = ref("");
-const token = ref("");
-const issuedToken = ref("");
-const issuedName = ref("");
-const confirmation = ref(null);
-const form = reactive({ enabled: false, serverUrl: "", deviceId: "", instrumentId: "" });
-const registration = reactive({ id: "", name: "", instrumentId: "" });
+const form = reactive({ instrumentId: "", instrumentType: "strength" });
 const history = reactive({ from: "", to: "" });
+const historyBusy = ref(false);
+const historyNotice = ref("");
 let timer;
 let disposed = false;
+
+const ID_PATTERN = /^[A-Z0-9][A-Z0-9_-]{0,23}$/;
+
 watch(
   () => props.syncStatus,
-  (value) => { if (value) status.value = value; },
+  (value) => {
+    if (value) status.value = value;
+  },
   { immediate: true },
 );
+
+const identityLocked = computed(() => Boolean(settings.value?.identityLocked));
+const registration = computed(() => status.value?.registrationState || null);
+const stateLabel = computed(() => {
+  switch (registration.value) {
+    case "revoked":
+      return "停用";
+    case "pending":
+      return "待批准";
+    case "approved":
+      if (status.value?.connected === true) return "在线";
+      if (status.value?.connected === false) return "断线";
+      return "已批准";
+    case "unconfigured":
+      return "未配置";
+    default:
+      return "未知";
+  }
+});
+const stateTone = computed(() => {
+  switch (registration.value) {
+    case "approved":
+      return status.value?.connected === false ? "warn" : "good";
+    case "pending":
+      return "warn";
+    case "revoked":
+      return "bad";
+    default:
+      return "idle";
+  }
+});
+const typeName = computed(
+  () =>
+    types.value.find((item) => item.id === form.instrumentType)?.name ||
+    form.instrumentType,
+);
+const pendingCount = computed(() =>
+  status.value?.queueMetricsStale
+    ? "未知（存储异常）"
+    : (status.value?.pending ?? "未知"),
+);
+
 function time(value) {
   return value ? new Date(value).toLocaleString("zh-CN") : "暂无记录";
 }
-async function load(refreshForm = false) {
-  if (loading.value || (server.value && !admin.value)) return;
-  loading.value = true;
-  error.value = "";
+
+async function loadTypes() {
   try {
-    const data = await request(server.value ? "/devices" : "/sync", {
-      retries: 0,
-      localAdmin: !server.value,
-    });
+    const data = await request("/instrument-types", { retries: 0 });
+    if (!Array.isArray(data?.types) || !data.types.length)
+      throw new Error("服务未提供可用的仪器类型");
     if (disposed) return;
-    if (server.value) devices.value = data.devices;
-    else {
-      status.value = data.status;
-      canManage.value = Boolean(data.canManage && admin.value);
-      if (!settings.value || refreshForm) {
-        settings.value = data.settings;
-        Object.assign(form, {
-          enabled: data.settings.enabled,
-          serverUrl: data.settings.serverUrl,
-          deviceId: data.settings.deviceId,
-          instrumentId: data.settings.instrumentId,
-        });
-      }
+    types.value = data.types;
+    typesError.value = "";
+  } catch (cause) {
+    if (!disposed) typesError.value = cause.message;
+  }
+}
+
+async function load(refreshForm = false) {
+  if (loading.value || server.value || disposed) return;
+  loading.value = true;
+  try {
+    const data = await request("/sync", { retries: 0, localAdmin: true });
+    if (disposed) return;
+    status.value = data.status || status.value;
+    canManage.value = Boolean(data.canManage && admin.value);
+    if (data.settings && (!settings.value || refreshForm)) {
+      settings.value = data.settings;
+      form.instrumentId = data.settings.instrumentId || "";
+      form.instrumentType = data.settings.instrumentType || "strength";
     }
     loaded.value = true;
+    stale.value = false;
+    error.value = "";
   } catch (cause) {
-    if (!disposed) error.value = cause.message;
+    if (disposed) return;
+    error.value = cause.message;
+    stale.value = true;
   } finally {
     loading.value = false;
   }
 }
+
 async function save() {
-  if (busy.value || !canManage.value) return;
+  if (busy.value || !canManage.value || identityLocked.value || typesError.value || !types.value.length) return;
+  const instrumentId = form.instrumentId.trim().toUpperCase();
+  if (!ID_PATTERN.test(instrumentId)) {
+    error.value =
+      "仪器编号需为 1–24 位大写字母、数字、- 或 _，并以字母或数字开头。";
+    return;
+  }
   busy.value = "save";
   error.value = "";
   success.value = "";
-  const body = { ...form, serverUrl: form.serverUrl.trim(), instrumentId: form.instrumentId.trim(), instrumentType: "strength" };
-  if (token.value) body.token = token.value;
-  token.value = "";
   try {
-    await request("/sync", { method: "PUT", body, localAdmin: true });
-    success.value = "上传配置已保存。启用不代表上传完成，请查看待传数量与最近成功时间。";
+    await request("/sync", {
+      method: "PUT",
+      body: { instrumentId, instrumentType: form.instrumentType },
+      localAdmin: true,
+    });
+    success.value = `已保存并申请接入（编号 ${instrumentId}）。采集与上传随即启用；显示“待批准”时请让管理员在中心仪器页批准。`;
     await load(true);
+    emit("refresh-status");
   } catch (cause) {
     error.value = cause.message;
   } finally {
@@ -91,10 +153,8 @@ async function retry() {
   if (busy.value || !canManage.value) return;
   busy.value = "retry";
   error.value = "";
-  success.value = "";
   try {
     await request("/sync/retry", { method: "POST", body: {}, localAdmin: true });
-    success.value = "已请求重试；是否收到确认以下方实际状态为准。";
     await load();
   } catch (cause) {
     error.value = cause.message;
@@ -102,72 +162,29 @@ async function retry() {
     busy.value = "";
   }
 }
+
 async function backfill() {
-  if (busy.value || !canManage.value) return;
-  busy.value = "backfill";
-  error.value = "";
-  success.value = "";
+  if (historyBusy.value || !canManage.value) return;
+  historyBusy.value = true;
+  historyNotice.value = "";
   try {
-    await request("/sync/backfill", { method: "POST", body: { ...history }, localAdmin: true });
-    success.value = "历史补传任务已落盘，后台分批扫描；重启后继续，不影响当天采集。";
-    await load();
-  } catch (cause) {
-    error.value = cause.message;
-  } finally {
-    busy.value = "";
-  }
-}
-async function createDevice() {
-  if (busy.value) return;
-  busy.value = "create";
-  error.value = "";
-  success.value = "";
-  try {
-    const data = await request("/devices", {
+    await request("/sync/backfill", {
       method: "POST",
-      body: { id: registration.id.trim(), name: registration.name.trim(), instrumentId: registration.instrumentId.trim(), instrumentType: "strength" },
+      body: { ...history },
+      localAdmin: true,
     });
-    if (disposed) return;
-    issuedName.value = data.device.name;
-    issuedToken.value = data.token;
-    Object.assign(registration, { id: "", name: "", instrumentId: "" });
+    historyNotice.value =
+      "历史补传任务已安排，后台分批处理，重启后继续；不影响当天采集。";
     await load();
   } catch (cause) {
-    error.value = cause.message;
+    historyNotice.value = `补传安排失败：${cause.message}`;
   } finally {
-    busy.value = "";
+    historyBusy.value = false;
   }
 }
-async function changeDevice() {
-  if (busy.value || !confirmation.value) return;
-  const { device, action } = confirmation.value;
-  busy.value = device.id;
-  error.value = "";
-  success.value = "";
-  try {
-    const data = await request(`/devices/${encodeURIComponent(device.id)}${action === "rotate" ? "/rotate" : ""}`, {
-      method: action === "rotate" ? "POST" : "DELETE",
-      body: {},
-    });
-    if (disposed) return;
-    confirmation.value = null;
-    if (action === "rotate") {
-      issuedName.value = device.name;
-      issuedToken.value = data.token;
-    } else success.value = `已撤销 ${device.name} 的上传权限，已有报告保留。`;
-    await load();
-  } catch (cause) {
-    error.value = cause.message;
-    confirmation.value = null;
-  } finally {
-    busy.value = "";
-  }
-}
-function dismissToken() {
-  issuedToken.value = "";
-  issuedName.value = "";
-}
+
 onMounted(() => {
+  loadTypes();
   load();
   timer = setInterval(() => {
     if (!busy.value && document.visibilityState === "visible") load();
@@ -176,114 +193,186 @@ onMounted(() => {
 onUnmounted(() => {
   disposed = true;
   clearInterval(timer);
-  token.value = "";
-  dismissToken();
 });
 </script>
 
 <template>
-  <section class="settings-section">
+  <section v-if="!server" class="settings-section">
     <div class="section-heading">
       <CloudUpload :size="21" />
       <div>
-        <h2>{{ server ? "采集设备" : "中心服务器上传" }}</h2>
-        <p>{{ server ? "接收各设备独立上传的报告，不依赖远程访问采集电脑。" : "只上传本机报告，局域网汇总不会重复上传。" }}</p>
+        <h2>中心接入</h2>
+        <p>填写仪器类型与编号并保存，即申请接入中心并开始采集与上传。</p>
       </div>
+      <button
+        class="icon-button"
+        aria-label="刷新接入状态"
+        :disabled="loading || !!busy"
+        @click="load(true); loadTypes()"
+      >
+        <RefreshCw :size="18" :class="{ spinning: loading }" />
+      </button>
     </div>
-    <p v-if="server && !admin" class="muted">设备凭据与连接状态由管理员管理。</p>
-    <template v-else>
-      <p v-if="error" class="error-message" role="alert">{{ error }}。下方状态可能是上次获取的数据。</p>
-      <p v-if="success" class="success-message" role="status">{{ success }}</p>
-      <button type="button" :disabled="loading || !!busy" @click="load(true)"><RefreshCw :size="17" />{{ loading ? "正在读取…" : "刷新配置与状态" }}</button>
-      <template v-if="server">
-        <p class="notice">最近在线或待传为零都不保证报告完整；请结合最后接收时间与采集电脑状态核对。状态每 30 秒更新。</p>
-        <form class="form-stack" @submit.prevent="createDevice">
-          <h3>注册采集设备</h3>
-          <div class="form-columns">
-            <label>设备 ID<input v-model="registration.id" required maxlength="36" placeholder="复制采集电脑上传设置中的设备 ID" autocomplete="off" /></label>
-            <label>设备名称<input v-model="registration.name" required maxlength="128" placeholder="例如：一号采集电脑" /></label>
-            <label>仪器标识<input v-model="registration.instrumentId" required maxlength="128" placeholder="与采集电脑配置一致" /></label>
-            <label>仪器类型<input value="强度仪（strength）" readonly /></label>
-          </div>
-          <p class="field-help">请先复制客户端的设备 ID，注册后将一次性显示的令牌填入该客户端。</p>
-          <div><button class="primary" :disabled="!!busy || loading">{{ busy === "create" ? "正在注册…" : "注册并生成令牌" }}</button></div>
-        </form>
-        <p v-if="loaded && !devices.length" class="muted">尚未注册采集设备。</p>
-        <section v-for="device in devices" :key="device.id" class="settings-section">
-          <h3>{{ device.name }} <span class="badge">{{ device.revoked ? "已撤销" : "允许上传" }}</span></h3>
-          <dl class="status-grid">
-            <div><dt>设备 ID</dt><dd class="device-identifier">{{ device.id }}</dd></div>
-            <div><dt>仪器</dt><dd>{{ device.instrumentId }} · 强度仪</dd></div>
-            <div><dt>最近在线</dt><dd>{{ time(device.lastSeenAt) }}</dd></div>
-            <div><dt>最近接收报告</dt><dd>{{ time(device.lastReceivedAt) }}</dd></div>
-            <div><dt>设备上报待传数</dt><dd>{{ device.pending ?? "未知" }}</dd></div>
-            <div><dt>最早待传</dt><dd>{{ time(device.oldestPendingAt) }}</dd></div>
-          </dl>
-          <p v-if="device.lastError" class="error-message">{{ device.lastError }}</p>
-          <div class="button-row">
-            <button :disabled="!!busy || loading" @click="confirmation = { device, action: 'rotate' }">{{ device.revoked ? "重新授权并生成令牌" : "轮换令牌" }}</button>
-            <button v-if="!device.revoked" :disabled="!!busy || loading" @click="confirmation = { device, action: 'revoke' }">撤销上传权限</button>
-          </div>
-        </section>
-      </template>
-      <template v-else>
-        <p class="notice">无法连接中心服务器时，本地报告仍可采集、保存与查看，待网络恢复补传。网页显示在线不代表上传完成。</p>
-        <p class="field-help">关闭窗口不等于停止后台服务；只有服务持续运行时才会继续采集与上传。停止服务或关机期间无法采集，重启后会核对仍在磁盘的报告，并继续补传已入队的数据。</p>
-        <dl v-if="status" class="status-grid">
-          <div><dt>上传状态</dt><dd>{{ uploadState }}</dd></div>
-          <div><dt>待传事件</dt><dd>{{ status.queueMetricsStale ? "未知（存储异常）" : (status.pending ?? "未知") }}</dd></div>
-          <div><dt>最早待传</dt><dd>{{ time(status.oldestPendingAt) }}</dd></div>
-          <div><dt>最近收到上传确认</dt><dd>{{ time(status.lastSuccessAt) }}</dd></div>
-          <div><dt>下次尝试</dt><dd>{{ time(status.nextAttemptAt) }}</dd></div>
-          <div><dt>待补扫历史日期</dt><dd>{{ status.queueMetricsStale ? "未知" : (status.backfillPendingDays ?? 0) }}</dd></div>
-        </dl>
-        <p v-if="status?.lastError" class="error-message" role="alert">{{ status.lastError }}</p>
-        <form v-if="settings" class="form-stack" @submit.prevent="save">
-          <fieldset :disabled="!canManage || !!busy" class="sync-fields">
-            <label class="check-label"><input v-model="form.enabled" type="checkbox" />启用中心服务器上传</label>
-            <div class="form-columns">
-              <label class="full-width">服务器 HTTPS 地址<input v-model="form.serverUrl" type="url" pattern="https://.*" :required="form.enabled" placeholder="https://reports.example.com" autocomplete="off" /></label>
-              <label>本机设备 ID<input :value="form.deviceId" readonly /></label>
-              <label>仪器标识<input v-model="form.instrumentId" :required="form.enabled" maxlength="128" placeholder="与服务器注册信息一致" /></label>
-              <label>仪器类型<input value="强度仪（strength）" readonly /></label>
-              <label>设备上传令牌<input v-model="token" type="password" autocomplete="new-password" :placeholder="settings.tokenConfigured ? '已配置，留空保留' : '输入服务器生成的设备令牌'" :required="form.enabled && !settings.tokenConfigured" /></label>
-            </div>
-          </fieldset>
-          <p class="field-help">令牌只提交至本机服务，不写入浏览器缓存。轮换后请填入新令牌；提交后输入框会清空。</p>
-          <p v-if="!canManage" class="muted">上传配置和重试仅允许本机管理员操作，请使用采集电脑的粒子桌面。</p>
-          <div v-else class="button-row">
-            <button class="primary" :disabled="!!busy || loading">{{ busy === "save" ? "正在保存…" : "保存上传配置" }}</button>
-            <button type="button" :disabled="!!busy || loading || !status?.enabled" @click="retry">{{ busy === "retry" ? "正在请求…" : "立即重试" }}</button>
-          </div>
-        </form>
-        <form v-if="canManage" class="form-stack" @submit.prevent="backfill">
-          <h3>补传历史报告</h3>
-          <p class="field-help">首次启用不会自动解析全部旧目录。需要网页查看历史报告时，选择报告目录日期范围；任务持久保存、分批处理，最多十年。已上传且未修改的报告不会重复入库。</p>
-          <div class="form-columns">
-            <label>起始日期<input v-model="history.from" type="date" required :max="history.to || undefined" /></label>
-            <label>结束日期<input v-model="history.to" type="date" required :min="history.from || undefined" /></label>
-          </div>
-          <div><button :disabled="!!busy || loading || !settings?.tokenConfigured">{{ busy === 'backfill' ? '正在安排…' : '安排历史补传' }}</button></div>
-        </form>
-      </template>
-    </template>
-    <Modal v-if="issuedToken" title="请保存设备上传令牌" @close="dismissToken">
-      <p>{{ issuedName }} 的令牌仅显示这一次，请复制到对应采集电脑的上传设置。关闭后无法再次读取，只能轮换。</p>
-      <label class="form-stack">设备令牌<textarea :value="issuedToken" rows="3" readonly spellcheck="false" autocomplete="off" @focus="$event.target.select()" /></label>
-      <p class="field-help">不要发送到公开聊天、截图或日志中。此页面不会把令牌写入浏览器存储。</p>
-      <template #footer><button class="primary" @click="dismissToken">已保存，关闭显示</button></template>
-    </Modal>
-    <Modal v-if="confirmation" :title="confirmation.action === 'rotate' ? '生成新设备令牌？' : '撤销设备上传权限？'" @close="!busy && (confirmation = null)">
-      <p>{{ confirmation.device.name }}：{{ confirmation.action === "rotate" ? "旧令牌立即失效，新令牌仅显示一次。请在采集电脑更新令牌后继续补传。" : "已有报告保留，新上传将被拒绝；本地采集不受影响。" }}</p>
-      <template #footer>
-        <button :disabled="!!busy" @click="confirmation = null">取消</button>
-        <button class="primary" :disabled="!!busy" @click="changeDevice">{{ busy ? "正在处理…" : "确认" }}</button>
-      </template>
-    </Modal>
+    <p v-if="error" class="error-message" role="alert">
+      {{ error }}{{ stale ? "（下方为上次获取的数据，可能已过期）" : "" }}
+    </p>
+    <p v-if="typesError" class="error-message" role="alert">仪器类型读取失败：{{ typesError }}</p>
+    <p v-if="success" class="success-message" role="status">{{ success }}</p>
+    <p v-if="stale && loaded && !error" class="notice" role="status">
+      暂时无法刷新，显示的是上次获取的接入状态，已标记为可能过期。
+    </p>
+    <dl class="status-grid identity-status">
+      <div>
+        <dt>接入状态</dt>
+        <dd>
+          <span class="status-dot" :class="stateTone" />{{ stateLabel }}
+        </dd>
+      </div>
+      <div>
+        <dt>待传事件</dt>
+        <dd>{{ pendingCount }}</dd>
+      </div>
+      <div>
+        <dt>上次成功上传</dt>
+        <dd>{{ time(status?.lastSuccessAt) }}</dd>
+      </div>
+      <div>
+        <dt>仪器编号</dt>
+        <dd>{{ settings?.instrumentId || "未配置" }}</dd>
+      </div>
+    </dl>
+    <p v-if="status?.lastError" class="error-message" role="alert">
+      上传错误：{{ status.lastError }}
+    </p>
+    <p v-if="status?.acquisitionError" class="error-message" role="alert">
+      采集错误：{{ status.acquisitionError }}
+    </p>
+    <p v-if="registration === 'revoked'" class="notice">
+      此仪器已被中心停用。重新启用由管理员在中心仪器页操作，启用后会自动恢复上传。
+    </p>
+    <form v-if="settings" class="form-stack" @submit.prevent="save">
+      <fieldset
+        :disabled="!canManage || identityLocked || !!busy || loading || !!typesError || !types.length"
+        class="identity-fields"
+      >
+        <div class="form-columns">
+          <label
+            >仪器类型<select v-model="form.instrumentType">
+              <option v-for="item in types" :key="item.id" :value="item.id">
+                {{ item.name }}
+              </option>
+            </select></label
+          >
+          <label
+            >仪器编号<input
+              v-model="form.instrumentId"
+              required
+              maxlength="24"
+              placeholder="例如 A01"
+              autocomplete="off"
+              spellcheck="false"
+          /></label>
+        </div>
+      </fieldset>
+      <p v-if="identityLocked" class="field-help">
+        已产生采集事件，仪器编号与类型已锁定，避免历史报告归属改变。更换仪器请联系管理员保留原数据后重新配置采集端。
+      </p>
+      <p v-else class="field-help">
+        编号将转为大写：1–24 位大写字母、数字、- 或 _，以字母或数字开头。保存即申请接入，无需复制令牌。
+      </p>
+      <p v-if="!canManage" class="muted">
+        仪器配置仅允许本机管理员操作，请使用采集电脑的桌面应用。
+      </p>
+      <div v-if="canManage" class="button-row">
+        <button class="primary" :disabled="identityLocked || !!busy || loading || !!typesError || !types.length">
+          {{ busy === "save" ? "正在保存…" : "保存并申请接入" }}
+        </button>
+      </div>
+    </form>
+    <p v-else-if="loaded" class="muted">未能读取仪器配置。</p>
+    <details class="client-diagnostics">
+      <summary>上传与补传诊断</summary>
+      <p class="field-help">
+        关闭窗口不等于停止后台服务；服务持续运行时才会继续采集与上传。停止服务或关机期间无法采集，重启后会核对磁盘上的报告并继续补传。
+      </p>
+      <dl class="status-grid">
+        <div>
+          <dt>下次尝试</dt>
+          <dd>{{ time(status?.nextAttemptAt) }}</dd>
+        </div>
+        <div>
+          <dt>最早待传</dt>
+          <dd>{{ time(status?.oldestPendingAt) }}</dd>
+        </div>
+        <div>
+          <dt>待补扫历史日期</dt>
+          <dd>
+            {{ status?.queueMetricsStale ? "未知" : (status?.backfillPendingDays ?? "未知") }}
+          </dd>
+        </div>
+        <div>
+          <dt>客户端版本</dt>
+          <dd>{{ status?.clientVersion || "未知" }}</dd>
+        </div>
+      </dl>
+      <button v-if="canManage && settings?.configured" :disabled="!!busy || loading" @click="retry">
+        {{ busy === "retry" ? "正在重试…" : "修复后重试" }}
+      </button>
+      <form v-if="canManage" class="form-stack" @submit.prevent="backfill">
+        <h3>补传历史报告</h3>
+        <p class="field-help">
+          选择报告目录的日期范围；任务持久保存、分批处理。已上传且未修改的报告不会重复入库。
+        </p>
+        <div class="form-columns">
+          <label
+            >起始日期<input
+              v-model="history.from"
+              type="date"
+              required
+              :max="history.to || undefined"
+          /></label>
+          <label
+            >结束日期<input
+              v-model="history.to"
+              type="date"
+              required
+              :min="history.from || undefined"
+          /></label>
+        </div>
+        <div>
+          <button :disabled="historyBusy || loading">
+            {{ historyBusy ? "正在安排…" : "安排历史补传" }}
+          </button>
+        </div>
+      </form>
+      <p v-if="historyNotice" class="notice" role="status">{{ historyNotice }}</p>
+    </details>
   </section>
 </template>
 
 <style scoped>
-.sync-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 16px; }
-.device-identifier { overflow-wrap: anywhere; }
+.identity-fields {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.identity-status .status-dot.good {
+  background: #4c9b7b;
+}
+.identity-status .status-dot.warn {
+  background: #d99a3d;
+}
+.identity-status .status-dot.bad {
+  background: #c05a4d;
+}
+.client-diagnostics {
+  margin-top: 18px;
+}
+.client-diagnostics > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #455e71;
+  padding: 8px 0;
+}
 </style>

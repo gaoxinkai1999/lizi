@@ -17,7 +17,7 @@ for (const entry of [
   "packages/core/package.json", "packages/core/src",
   "packages/server/package.json", "packages/server/src",
   "apps/web/package.json", "apps/web/dist", "apps/desktop/package.json",
-  "deploy/Dockerfile", "deploy/compose.yaml", "deploy/install-linux.sh",
+  "deploy/Dockerfile", "deploy/compose.yaml", "deploy/install-linux.sh", "deploy/reports.abocidee.com.conf",
   "scripts/start-server.js", "README.md",
 ]) {
   await mkdir(dirname(join(staging, entry)), { recursive: true });
