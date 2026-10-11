@@ -708,6 +708,11 @@ label {
 .result-count strong {
   font-size: 16px;
 }
+.details-toggle {
+  min-height: 0;
+  font-size: 12px;
+  white-space: nowrap;
+}
 .result-count > .muted {
   font-size: 11px;
 }

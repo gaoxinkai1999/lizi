@@ -1,5 +1,5 @@
 export const CENTER_URL = "https://reports.abocidee.com";
-export const APP_VERSION = "3.1.1";
+export const APP_VERSION = "3.1.2";
 export const INSTRUMENT_TYPES = Object.freeze([
   Object.freeze({ id: "strength", name: "强度仪", schemaVersion: 1, parserVersion: 2 }),
 ]);

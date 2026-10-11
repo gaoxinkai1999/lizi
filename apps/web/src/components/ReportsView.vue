@@ -66,6 +66,7 @@ const cacheAllowed = computed(
 const actionError = ref("");
 const notice = ref("");
 const cached = ref(false);
+const showDetails = ref(false);
 const detail = ref(null);
 const actionBusy = ref("");
 const actionProgress = ref("");
@@ -629,6 +630,10 @@ onUnmounted(() => {
           <template v-else-if="cached"> · 缓存</template>
         </span>
       </div>
+      <label class="check-label details-toggle">
+        <input v-model="showDetails" type="checkbox" :disabled="!reports.length" />
+        显示明细列（1–{{ testsCount }}）
+      </label>
       <button
         class="primary"
         :disabled="!online || !readyForActions || !!actionBusy"
@@ -762,10 +767,12 @@ onUnmounted(() => {
                 <th>产线</th>
                 <th>样品</th>
                 <th>来源 / 仪器</th>
-                <th class="average-column">平均 / g</th>
                 <th>最大 / g</th>
+                <th class="average-column">平均 / g</th>
                 <th>最小 / g</th>
-                <th v-for="index in testsCount" :key="index">{{ index }}</th>
+                <template v-if="showDetails">
+                  <th v-for="index in testsCount" :key="index">{{ index }}</th>
+                </template>
                 <th>详情</th>
               </tr>
             </thead>
@@ -796,14 +803,16 @@ onUnmounted(() => {
                   />{{ report.sampleName }}
                 </td>
                 <td>{{ report.sourceName || report.sourceId || "本机" }}<span v-if="report.instrumentId"> · {{ report.instrumentId }}</span></td>
+                <td>{{ showValue(report.maxHardness) }}</td>
                 <td class="average-column">
                   {{ showValue(report.averageHardness) }}
                 </td>
-                <td>{{ showValue(report.maxHardness) }}</td>
                 <td>{{ showValue(report.minHardness) }}</td>
-                <td v-for="index in testsCount" :key="index">
-                  {{ showValue(report.testResults?.[index - 1]?.gram) }}
-                </td>
+                <template v-if="showDetails">
+                  <td v-for="index in testsCount" :key="index">
+                    {{ showValue(report.testResults?.[index - 1]?.gram) }}
+                  </td>
+                </template>
                 <td>
                   <button class="text-button" @click="detail = report">
                     查看
