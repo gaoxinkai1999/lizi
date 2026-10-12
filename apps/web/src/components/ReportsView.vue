@@ -12,7 +12,7 @@ import { currentShift } from "../../../../packages/core/src/current-shift.js";
 import { readReportPage, saveReportPage, pageKey } from "../offline-cache.js";
 import { createReportImages } from "../report-images.js";
 import { createRecordImages } from "../report-record-images.js";
-import { buildRecordSheets } from "../report-record.js";
+import { buildRecordSheets } from "../../../../packages/core/src/report-record.js";
 import Modal from "./Modal.vue";
 import ReportDetail from "./ReportDetail.vue";
 const props = defineProps({

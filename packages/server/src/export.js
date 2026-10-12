@@ -2,7 +2,7 @@ import ExcelJS from "exceljs";
 import { once } from "node:events";
 import { setImmediate } from "node:timers/promises";
 import { reportColumns } from "@lizi/core";
-import { buildRecordSheets } from "../../../apps/web/src/report-record.js";
+import { buildRecordSheets } from "../../core/src/report-record.js";
 import { httpError } from "./directories.js";
 
 const SUMMARY_ROWS = [
