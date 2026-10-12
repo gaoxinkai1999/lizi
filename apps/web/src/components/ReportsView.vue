@@ -11,6 +11,8 @@ import { localDate, request, saveBlob, showValue } from "../api.js";
 import { currentShift } from "../../../../packages/core/src/current-shift.js";
 import { readReportPage, saveReportPage, pageKey } from "../offline-cache.js";
 import { createReportImages } from "../report-images.js";
+import { createRecordImages } from "../report-record-images.js";
+import { buildRecordSheets } from "../report-record.js";
 import Modal from "./Modal.vue";
 import ReportDetail from "./ReportDetail.vue";
 const props = defineProps({
@@ -67,6 +69,8 @@ const actionError = ref("");
 const notice = ref("");
 const cached = ref(false);
 const showDetails = ref(false);
+const viewMode = ref("record");
+const sheetIndex = ref(0);
 const detail = ref(null);
 const actionBusy = ref("");
 const actionProgress = ref("");
@@ -163,6 +167,22 @@ const testsCount = computed(() =>
     ...reports.value.map((report) => report.testResults?.length || 0),
   ),
 );
+const recordSheets = computed(() => buildRecordSheets(reports.value));
+const activeSheet = computed(
+  () => recordSheets.value[sheetIndex.value] ?? recordSheets.value[0] ?? null,
+);
+const recordMode = computed(() => viewMode.value === "record");
+watch(recordSheets, (sheets) => {
+  if (sheetIndex.value > sheets.length - 1) sheetIndex.value = 0;
+});
+function showSheet(index) {
+  const total = recordSheets.value.length;
+  if (!total) return;
+  sheetIndex.value = Math.min(Math.max(index, 0), total - 1);
+}
+function recordSummary(key) {
+  return { max: "最大", average: "平均", min: "最小" }[key];
+}
 const readyForActions = computed(() =>
   Boolean(loadedQuery.value && total.value > 0 && !indexing.value),
 );
@@ -433,6 +453,7 @@ async function exportReports(onlySelected = false) {
     date,
     shift,
     excludeAggregate: onlySelected ? excludeAggregate : true,
+    ...(recordMode.value ? { view: "record" } : {}),
   };
   if (onlySelected) {
     if (wholeQuery.value) snapshot.allSelected = true;
@@ -546,11 +567,32 @@ async function generateImages() {
   const title = `${snapshot.date} ${shiftNames[snapshot.shift]}`;
   try {
     releaseImages();
-    images.value = await createReportImages(
-      imageReports(snapshot, [...selected.value], wholeQuery.value, signal),
-      title,
-      { signal },
-    );
+    if (recordMode.value) {
+      const sheets = recordSheets.value;
+      if (!sheets.length) throw new Error("当前查询没有可生成记录表的报告。");
+      const grouped = [];
+      for (const sheet of sheets) {
+        const byId = new Map(
+          reports.value
+            .filter((report) => String(report.line ?? "unknown") === sheet.key)
+            .map((report) => [report.id, report]),
+        );
+        grouped.push({
+          ...sheet,
+          columns: sheet.columns.map((column) => ({
+            ...column,
+            sampleName: byId.get(column.id)?.sampleName ?? column.sampleName,
+          })),
+        });
+      }
+      images.value = await createRecordImages(grouped, { signal, title });
+    } else {
+      images.value = await createReportImages(
+        imageReports(snapshot, [...selected.value], wholeQuery.value, signal),
+        title,
+        { signal },
+      );
+    }
     imageOpen.value = true;
   } catch (cause) {
     if (cause.name !== "AbortError") actionError.value = cause.message;
@@ -630,7 +672,23 @@ onUnmounted(() => {
           <template v-else-if="cached"> · 缓存</template>
         </span>
       </div>
-      <label class="check-label details-toggle">
+      <div class="view-switch" role="group" aria-label="报告视图">
+        <button
+          :class="{ active: recordMode }"
+          :aria-pressed="recordMode"
+          @click="viewMode = 'record'"
+        >
+          记录表
+        </button>
+        <button
+          :class="{ active: !recordMode }"
+          :aria-pressed="!recordMode"
+          @click="viewMode = 'list'"
+        >
+          明细表
+        </button>
+      </div>
+      <label v-if="!recordMode" class="check-label details-toggle">
         <input v-model="showDetails" type="checkbox" :disabled="!reports.length" />
         显示明细列（1–{{ testsCount }}）
       </label>
@@ -742,7 +800,83 @@ onUnmounted(() => {
       <button @click="yesterday">查看昨日完整报告</button>
     </div>
     <template v-else>
-      <div class="report-results view-table" :aria-busy="loading">
+      <template v-if="recordMode && activeSheet">
+        <div class="record-pager">
+          <button
+            type="button"
+            :disabled="sheetIndex <= 0"
+            aria-label="上一张"
+            @click="showSheet(sheetIndex - 1)"
+          >
+            ‹
+          </button>
+          <button
+            v-for="(sheet, index) in recordSheets"
+            :key="sheet.key"
+            type="button"
+            :class="{ active: index === sheetIndex }"
+            @click="showSheet(index)"
+          >
+            {{ sheet.label }}
+          </button>
+          <button
+            type="button"
+            :disabled="sheetIndex >= recordSheets.length - 1"
+            aria-label="下一张"
+            @click="showSheet(sheetIndex + 1)"
+          >
+            ›
+          </button>
+          <span class="position">第 {{ sheetIndex + 1 }} / {{ recordSheets.length }} 张</span>
+        </div>
+        <div class="record-sheet">
+          <h2>{{ activeSheet.title }}</h2>
+          <div class="record-table-wrap">
+            <table>
+              <thead>
+                <tr class="record-meta">
+                  <th class="row-label">日期</th>
+                  <th :colspan="activeSheet.columns.length">{{ activeSheet.date }}</th>
+                </tr>
+                <tr>
+                  <th class="row-label">时间</th>
+                  <th v-for="column in activeSheet.columns" :key="column.id">
+                    {{ column.time }}
+                  </th>
+                </tr>
+                <tr>
+                  <th class="row-label">炉号</th>
+                  <th v-for="column in activeSheet.columns" :key="column.id">
+                    {{ showValue(activeSheet.key === "unknown" ? null : activeSheet.key) }}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(row, rowIndex) in activeSheet.rows" :key="rowIndex">
+                  <td class="row-label">{{ rowIndex + 1 }}</td>
+                  <td v-for="(value, columnIndex) in row" :key="columnIndex">
+                    {{ showValue(value) }}
+                  </td>
+                </tr>
+                <tr
+                  v-for="key in ['max', 'average', 'min']"
+                  :key="key"
+                  class="record-summary"
+                >
+                  <td class="row-label">{{ recordSummary(key) }}</td>
+                  <td
+                    v-for="(value, columnIndex) in activeSheet.summary[key]"
+                    :key="columnIndex"
+                  >
+                    {{ showValue(value) }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
+      <div v-else class="report-results view-table" :aria-busy="loading">
         <div
           class="full-table table-wrap"
           tabindex="0"
@@ -824,7 +958,11 @@ onUnmounted(() => {
         </div>
       </div>
     </template>
-    <div v-if="pageCount > 1 || query.page > 1" class="pagination" aria-label="报告分页">
+    <div
+      v-if="!recordMode && (pageCount > 1 || query.page > 1)"
+      class="pagination"
+      aria-label="报告分页"
+    >
       <button :disabled="query.page <= 1" @click="query.page--">上一页</button>
       <span>第 {{ query.page }} / {{ pageCount }} 页</span>
       <button :disabled="query.page >= pageCount" @click="query.page++">下一页</button>

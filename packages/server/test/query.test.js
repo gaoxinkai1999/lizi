@@ -114,10 +114,62 @@ test("date-scoped pages remain cacheable and cross-page/full exports preserve ag
     await workbook.xlsx.load(Buffer.from(await response.arrayBuffer()));
     return workbook.worksheets.map((sheet) => sheet.rowCount - 1);
   }
+  async function exportWorkbook(selection) {
+    const response = await request("/reports/export", {
+      method: "POST",
+      body: { date, shift: "day", ...selection },
+    });
+    assert.equal(response.status, 200);
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(Buffer.from(await response.arrayBuffer()));
+    return workbook;
+  }
   assert.deepEqual(await exportRows({}), [202, 202, 0]);
   assert.deepEqual(await exportRows({ allSelected: true }), [205, 205, 0]);
   const selected = [first.reports[0].id, third.reports[4].id];
   assert.deepEqual(await exportRows({ ids: selected }), [2, 2, 0]);
+  const record = await exportWorkbook({ view: "record" });
+  assert.equal(record.worksheets.length, 1);
+  const sheet = record.worksheets[0];
+  assert.equal(sheet.getCell("A1").value, "日期");
+  assert.equal(sheet.getCell("B1").value, date);
+  assert.equal(sheet.getCell("A2").value, "时间");
+  assert.equal(sheet.getCell("A3").value, "炉号");
+  const columnCount = sheet.getRow(2).cellCount;
+  assert.equal(sheet.rowCount, 1 + 2 + 20 + 3);
+  assert.equal(sheet.getCell(3, 2).value, 1, "炉号列取产线");
+  const summaryLabels = [
+    sheet.getCell(sheet.rowCount - 2, 1).value,
+    sheet.getCell(sheet.rowCount - 1, 1).value,
+    sheet.getCell(sheet.rowCount, 1).value,
+  ];
+  assert.deepEqual(summaryLabels, ["最大", "平均", "最小"]);
+  const firstColumn = [];
+  for (let row = 1; row <= 20; row += 1)
+    firstColumn.push(sheet.getCell(3 + row, 2).value);
+  const present = firstColumn.filter((value) => value !== null);
+  assert.ok(present.length > 0 && present.length <= 20);
+  assert.deepEqual(
+    present,
+    [...present].sort((a, b) => b - a),
+    "测点行按数值降序",
+  );
+  assert.equal(
+    sheet.getCell(sheet.rowCount, 2).value,
+    present[present.length - 1],
+    "最小行等于该列最小值",
+  );
+  assert.equal(
+    sheet.getCell(sheet.rowCount - 2, 2).value,
+    present[0],
+    "最大行等于该列最大值",
+  );
+  assert.equal(
+    sheet.getCell(sheet.rowCount - 1, 2).value,
+    Math.round(present.reduce((total, value) => total + value, 0) / present.length),
+    "平均行取整",
+  );
+  assert.ok(columnCount >= 2);
   const invalid = await request("/reports/export", {
     method: "POST",
     body: { date, ids: ["f".repeat(32)] },

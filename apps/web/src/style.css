@@ -713,6 +713,102 @@ label {
   font-size: 12px;
   white-space: nowrap;
 }
+.view-switch {
+  display: inline-flex;
+  gap: 6px;
+}
+.view-switch button {
+  min-height: 32px;
+  padding: 4px 13px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.view-switch button.active {
+  border-color: var(--accent);
+  background: #eff6f5;
+  color: var(--accent);
+}
+.record-pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+.record-pager > button {
+  min-height: 32px;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: #33485c;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.record-pager > button.active {
+  border-color: var(--accent);
+  background: #eff6f5;
+  color: var(--accent);
+}
+.record-pager .position {
+  color: var(--muted);
+  font-size: 12px;
+}
+.record-sheet h2 {
+  margin: 2px 0 8px;
+  font-size: 16px;
+}
+.record-table-wrap {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.record-table-wrap table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 14px;
+}
+.record-table-wrap th,
+.record-table-wrap td {
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 7px 10px;
+  text-align: center;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.record-table-wrap th:last-child,
+.record-table-wrap td:last-child {
+  border-right: 0;
+}
+.record-table-wrap thead th {
+  background: #f2f6f9;
+  font-weight: 600;
+}
+.record-table-wrap thead tr.record-meta th {
+  background: #f8fafc;
+  font-weight: 550;
+}
+.record-table-wrap .row-label {
+  width: 76px;
+  min-width: 76px;
+  color: var(--muted);
+  font-weight: 550;
+  background: #f8fafc;
+}
+.record-table-wrap tbody tr.record-summary td {
+  background: #eff6f5;
+  color: var(--accent-dark);
+  font-weight: 700;
+}
+.record-table-wrap tbody tr.record-summary td.row-label {
+  background: #e7f1f0;
+}
 .result-count > .muted {
   font-size: 11px;
 }

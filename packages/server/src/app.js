@@ -274,7 +274,7 @@ export async function createApplication(options = {}) {
     });
     try {
       assertCurrentIdentity(req);
-      await exportReports(res, snapshot, query.date, query.shift);
+      await exportReports(res, snapshot, query.date, query.shift, req.body.view === "record" ? "record" : "list");
     } finally {
       await snapshot.close();
     }
