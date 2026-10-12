@@ -158,7 +158,7 @@ onMounted(loadUsers);
         <KeyRound :size="21" />
         <div>
           <h2>修改密码</h2>
-          <p>使用至少 12 个字符的独立密码。</p>
+          <p>密码为 1–256 个字符；建议使用独立的长密码。</p>
         </div>
       </div>
       <form class="form-stack password-form" @submit.prevent="changePassword">
@@ -181,14 +181,14 @@ onMounted(loadUsers);
               v-model="password.password"
               type="password"
               autocomplete="new-password"
-              minlength="12"
+              minlength="1"
               required /></label
           ><label
             >确认新密码<input
               v-model="password.confirm"
               type="password"
               autocomplete="new-password"
-              minlength="12"
+              minlength="1"
               required
           /></label>
         </div>
@@ -273,10 +273,10 @@ onMounted(loadUsers);
             v-model="form.password"
             type="password"
             autocomplete="new-password"
-            minlength="12"
+            minlength="1"
             :required="editingId === null"
             :placeholder="
-              editingId !== null ? '留空保留原密码' : '至少 12 个字符'
+              editingId !== null ? '留空保留原密码' : '至少 1 个字符'
             " /></label
         ><label v-if="editingId !== null" class="check-label"
           ><input v-model="form.disabled" type="checkbox" />停用此账户</label

@@ -78,6 +78,57 @@ async function fixture(t, { mode = "client", prepare } = {}) {
 
 const password = "a-password-long-enough";
 
+test("short passwords are accepted for user creation, login and self change", async (t) => {
+  const { request, token } = await fixture(t, { mode: "server" });
+  const setup = await request("/api/auth/setup", {
+    method: "POST",
+    body: { token, username: "admin", password: "ab" },
+  });
+  assert.equal(setup.status, 201);
+  const cookie = setup.headers.get("set-cookie").split(";")[0];
+  const created = await request("/api/users", {
+    method: "POST",
+    cookie,
+    body: { username: "shorty", password: "xy", role: "viewer" },
+  });
+  assert.equal(created.status, 201);
+  const login = await request("/api/auth/login", {
+    method: "POST",
+    body: { username: "shorty", password: "xy" },
+  });
+  assert.equal(login.status, 200);
+  const shortCookie = login.headers.get("set-cookie").split(";")[0];
+  assert.equal(
+    (
+      await request("/api/auth/password", {
+        method: "POST",
+        cookie: shortCookie,
+        body: { currentPassword: "xy", password: "z" },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request("/api/auth/login", {
+        method: "POST",
+        body: { username: "shorty", password: "z" },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await request("/api/users", {
+        method: "POST",
+        cookie,
+        body: { username: "emptypw", password: "", role: "viewer" },
+      })
+    ).status,
+    400,
+  );
+});
+
 test("LAN configuration remains local-only even when the report site is public", async (t) => {
   const { request, localAdminToken } = await fixture(t);
   const local = await (await request("/api/lan")).json();

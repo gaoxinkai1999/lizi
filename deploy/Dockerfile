@@ -10,6 +10,9 @@ RUN npm ci --omit=dev --ignore-scripts --workspace=@lizi/server --workspace=@liz
 COPY packages/core/src packages/core/src
 COPY packages/server/src packages/server/src
 COPY apps/web/dist apps/web/dist
+# Source copies can carry a restrictive umask; the container runs as `node`,
+# so the static bundle and sources must stay world-readable.
+RUN chmod -R a+rX apps/web/dist packages
 RUN mkdir /data && chown node:node /data
 USER node
 EXPOSE 3210

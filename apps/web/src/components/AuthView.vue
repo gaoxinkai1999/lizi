@@ -89,11 +89,11 @@ async function submit() {
             v-model="form.password"
             type="password"
             :autocomplete="initialized ? 'current-password' : 'new-password'"
-            :minlength="initialized ? undefined : 12"
+            :minlength="initialized ? undefined : 1"
             required
             placeholder="输入密码"
           /><span v-if="!initialized" class="field-help"
-            >至少 12 个字符，建议使用独立的长密码。</span
+            >至少 1 个字符；密码越简单越容易被猜中。</span
           ></label
         >
         <label v-if="!initialized"
@@ -101,7 +101,7 @@ async function submit() {
             v-model="form.confirm"
             type="password"
             autocomplete="new-password"
-            minlength="12"
+            minlength="1"
             required
         /></label>
         <p v-if="error" role="alert" class="error-message">{{ error }}</p>

@@ -58,10 +58,10 @@ export function validateUsername(username) {
 export function validatePassword(password) {
   if (
     typeof password !== "string" ||
-    password.length < 12 ||
+    password.length < 1 ||
     password.length > 256
   )
-    throw httpError(400, "密码需为 12–256 个字符");
+    throw httpError(400, "请输入密码（1–256 个字符）");
   return password;
 }
 
