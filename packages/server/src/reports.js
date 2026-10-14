@@ -139,6 +139,10 @@ export class ReportStore extends EventEmitter {
     return this.request("query", params);
   }
 
+  editReport(id, edit) {
+    return this.request("editReport", { id, ...edit });
+  }
+
   syncConfigure() {
     return this.request("syncConfigure");
   }

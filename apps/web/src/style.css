@@ -813,6 +813,23 @@ label {
 .record-table-wrap th.copy-column:hover {
   background: #e3efed;
 }
+/* Inline correction input: appears only while a value is being edited, so the
+   table keeps looking like a plain report at all other times. */
+.cell-editor {
+  width: 5.5rem;
+  max-width: 100%;
+  padding: 2px 4px;
+  font: inherit;
+  text-align: center;
+  color: inherit;
+  background: #fff;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+}
+.cell-editor:focus {
+  outline: 2px solid #bcd3d0;
+  outline-offset: 1px;
+}
 .copy-hint {
   margin: 0 0 6px;
   font-size: 12px;

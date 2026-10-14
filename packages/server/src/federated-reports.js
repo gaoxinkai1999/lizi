@@ -65,6 +65,10 @@ export class FederatedReportStore extends EventEmitter {
     this.selectionBytes = 0;
     this.refreshing = false;
     this.connected = Boolean(lan.getStatus().connected);
+    // Remote pages are re-read only when a peer reports a new revision, so an
+    // idle pair no longer re-renders the report page on the periodic sweep.
+    this.peerRevisions = new Map();
+    this.remotePending = false;
     this.listeners = [
       [localStore, "revision", () => this.changed()],
       [localStore, "status", () => this.emit("status", this.status())],
@@ -76,16 +80,20 @@ export class FederatedReportStore extends EventEmitter {
           for (const snapshot of this.snapshots)
             void snapshot.close().catch(() => {});
           this.connected = Boolean(lan.getStatus().connected);
+          this.remotePending = true;
           this.changed();
         },
       ],
-      [lan, "change", () => this.invalidate()],
+      [lan, "change", (info) => this.peerChanged(info)],
       [
         lan,
         "status",
         () => {
           const connected = Boolean(lan.getStatus().connected);
-          if (connected && !this.connected) this.invalidate();
+          if (connected && !this.connected) {
+            this.remotePending = true;
+            this.invalidate();
+          }
           this.connected = connected;
           this.changed();
         },
@@ -95,9 +103,25 @@ export class FederatedReportStore extends EventEmitter {
       emitter.on(event, listener);
     this.maintenance = setInterval(() => {
       this.expire();
-      this.invalidate();
+      // Belt and braces for a missed change notification: re-read remote pages
+      // only when a peer revision actually advanced (or a refresh failed).
+      if (this.remotePending) this.invalidate();
     }, 30000);
     this.maintenance.unref();
+  }
+
+  peerChanged(info) {
+    const peerId = info?.peerId ?? "";
+    const revision = Number(info?.revision);
+    if (!peerId || !Number.isSafeInteger(revision)) {
+      this.remotePending = true;
+      this.invalidate();
+      return;
+    }
+    if (this.peerRevisions.get(peerId) === revision) return;
+    this.peerRevisions.set(peerId, revision);
+    this.remotePending = true;
+    this.invalidate();
   }
 
   get root() {
@@ -114,6 +138,12 @@ export class FederatedReportStore extends EventEmitter {
   }
   scan() {
     return this.local.scan();
+  }
+  // Corrections only ever apply to this machine's own reports. A row from a
+  // paired peer is identified by a hash of (peer, report), so its id does not
+  // exist in the local index and the local store answers 404 for it.
+  editReport(id, edit) {
+    return this.local.editReport(id, edit);
   }
   getStatus() {
     return this.status();
@@ -310,8 +340,17 @@ export class FederatedReportStore extends EventEmitter {
       }
     } finally {
       this.refreshing = false;
+      // The sweep stays armed while any source is failing so an offline peer is
+      // retried, and disarms once everything read cleanly.
+      if (this.remotePending && !this.remoteUnhealthy()) this.remotePending = false;
       if ([...this.scopes.values()].some((scope) => scope.pending)) this.schedule();
     }
+  }
+
+  remoteUnhealthy() {
+    for (const scope of this.scopes.values())
+      for (const source of scope.sources.values()) if (source.warning) return true;
+    return false;
   }
 
   async refreshSource(scope, peer) {

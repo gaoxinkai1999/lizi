@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import iconv from "iconv-lite";
-import { decodeReport, filterReports, parseReport } from "../src/index.js";
+import {
+  applyReportEdit,
+  decodeReport,
+  filterReports,
+  hardnessSummary,
+  isAggregateSample,
+  parseReport,
+  sampleLine,
+} from "../src/index.js";
+import { buildRecordSheets } from "../src/report-record.js";
 
 const zeroReport = `Operator 操作员甲
 Date 2024-02-29_7-0-0
@@ -192,4 +201,85 @@ test("invalid dates, missing sample names and non-report content remain rejected
   ]) {
     assert.throws(() => parseReport(content));
   }
+});
+
+test("a corrected sample name re-derives the line and the aggregate flag exactly like parsing", () => {
+  assert.equal(sampleLine("4"), 4);
+  assert.equal(sampleLine("10 零值样品"), 10);
+  assert.equal(sampleLine("A-4"), null);
+  assert.equal(sampleLine(""), null);
+  assert.equal(sampleLine(null), null);
+  assert.equal(isAggregateSample("4总"), true);
+  assert.equal(isAggregateSample("Z 样品"), true);
+  assert.equal(isAggregateSample("4"), false);
+
+  const report = parseReport(zeroReport);
+  assert.equal(report.line, 10);
+  assert.equal(report.isAggregate, false);
+  const renamed = applyReportEdit(report, { sampleName: " 7总 " });
+  assert.equal(renamed.changed, true);
+  assert.equal(renamed.report.sampleName, "7总");
+  assert.equal(renamed.report.line, 7);
+  assert.equal(renamed.report.isAggregate, true);
+  assert.equal(report.sampleName, "10 零值样品", "原始报告不得被就地修改");
+
+  // A correction that changes nothing reports no change so the caller can skip
+  // writing a new version.
+  assert.equal(applyReportEdit(report, { sampleName: "10 零值样品" }).changed, false);
+  assert.equal(applyReportEdit(report, {}).changed, false);
+  for (const [edit, message] of [
+    [{ sampleName: "" }, /不能为空/],
+    [{ sampleName: "   " }, /不能为空/],
+    [{ sampleName: "x".repeat(200) }, /不能超过/],
+    [{ sampleName: "坏\u0000名" }, /不可用字符/],
+    [{ sampleName: 7 }, /必须为文本/],
+    [{ measurement: { index: -1, gram: 1 } }, /序号无效/],
+    [{ measurement: { index: 5, gram: 1 } }, /超出报告范围/],
+    [{ measurement: { index: 0, gram: "x" } }, /强度必须为/],
+    [{ measurement: { index: 0, gram: -1 } }, /强度必须为/],
+  ]) {
+    assert.throws(() => applyReportEdit(report, edit), message);
+  }
+});
+
+test("a corrected measurement re-derives the displayed statistics", () => {
+  const report = parseReport(
+    zeroReport.replace("1 0 0.0 0.0\n", "1 0 61 1.31\n2 0 52 1.33\n3 0 12 1.49\n"),
+  );
+  assert.deepEqual(
+    { max: report.maxHardness, average: report.averageHardness, min: report.minHardness },
+    { max: 0, average: 0, min: 0 },
+    "解析出的统计仍来自仪器字段",
+  );
+  const edited = applyReportEdit(report, { measurement: { index: 2, gram: 5 } });
+  assert.equal(edited.changed, true);
+  assert.equal(edited.report.testResults[2].gram, 5);
+  assert.equal(edited.report.maxHardness, 61);
+  assert.equal(edited.report.minHardness, 5);
+  assert.equal(edited.report.averageHardness, 39);
+  assert.equal(edited.report.testResults[0].gram, 61, "其它测点不受影响");
+  assert.deepEqual(hardnessSummary([]), {
+    maxHardness: null,
+    averageHardness: null,
+    minHardness: null,
+  });
+});
+
+test("record sheets keep the measurement index behind every displayed value", () => {
+  const report = {
+    id: "a".repeat(32),
+    date: "2026-09-23",
+    time: "08:00:00",
+    line: 4,
+    sampleName: "4",
+    testResults: [
+      { number: 1, test: 1, gram: 12, mm: 1.1 },
+      { number: 2, test: 2, gram: 61, mm: 1.2 },
+      { number: 3, test: 3, gram: 30, mm: 1.3 },
+    ],
+  };
+  const [sheet] = buildRecordSheets([report]);
+  assert.deepEqual(sheet.rows.slice(0, 3), [[61], [30], [12]]);
+  assert.deepEqual(sheet.columns[0].indexes.slice(0, 3), [1, 2, 0]);
+  assert.deepEqual(sheet.summary, { max: [61], min: [12], average: [34] });
 });

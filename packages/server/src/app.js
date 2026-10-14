@@ -247,6 +247,34 @@ export async function createApplication(options = {}) {
     if (!isServer) store.release(reportClient(req, true));
     res.json({ ok: true });
   });
+  // Local correction of report data. Client mode only: the center stores what
+  // devices report and never rewrites it. Restricted to the machine itself so a
+  // paired peer or a LAN client cannot alter this computer's reports.
+  if (!isServer) {
+    app.post(
+      "/api/reports/edit",
+      auth.admin,
+      requireLocalAdmin,
+      async (req, res) => {
+        const { id, sampleName, measurement } = req.body ?? {};
+        if (typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id))
+          throw httpError(400, "报告标识无效");
+        if (sampleName === undefined && measurement === undefined)
+          throw httpError(400, "没有需要修改的内容");
+        if (measurement !== undefined && measurement !== null) {
+          if (typeof measurement !== "object" || Array.isArray(measurement))
+            throw httpError(400, "测点参数无效");
+          const { index, gram } = measurement;
+          if (!Number.isInteger(index) || index < 0)
+            throw httpError(400, "测点序号无效");
+          if (typeof gram !== "number" || !Number.isFinite(gram))
+            throw httpError(400, "强度必须为数值");
+        }
+        const result = await store.editReport(id, { sampleName, measurement });
+        res.json({ id: result.id, changed: result.changed });
+      },
+    );
+  }
   app.post("/api/reports/export", async (req, res) => {
     const query = parseReportQuery(req.body);
     if (req.body.ids !== undefined) {

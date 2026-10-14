@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { parentPort, workerData } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
-import { shiftBounds } from "@lizi/core";
+import { applyReportEdit, shiftBounds } from "@lizi/core";
 import { instrumentFileAdapter } from "../../core/src/instruments.js";
 import { getSetting, setSetting, transaction } from "./database.js";
 import { httpError, isWithin } from "./directories.js";
@@ -928,9 +928,64 @@ async function acquireReports() {
   }
 }
 
+// Corrects a stored report: the sample name (which re-derives the production
+// line and the aggregate flag) or a single measurement value (which re-derives
+// the displayed hardness statistics). The instrument's own file is never
+// modified — the correction lives in the index and is queued for the center as a
+// new version, exactly like a changed file would be.
+function editStoredReport(params) {
+  if (!root) throw httpError(400, "请先选择本地报告目录");
+  const id = params?.id;
+  if (typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id))
+    throw httpError(400, "报告标识无效");
+  const row = db
+    .prepare("SELECT path,root,json,fingerprint FROM reports WHERE id=? AND root=?")
+    .get(id, root);
+  if (!row) throw httpError(404, "报告不存在");
+  let stored;
+  try {
+    stored = JSON.parse(row.json);
+  } catch {
+    throw httpError(500, "报告数据损坏，请重新扫描");
+  }
+  let applied;
+  try {
+    applied = applyReportEdit(stored, {
+      sampleName: params?.sampleName,
+      measurement: params?.measurement,
+    });
+  } catch (error) {
+    // Field validation is a client error, not a server fault.
+    throw httpError(400, error.message);
+  }
+  const { report, changed: edited } = applied;
+  if (!edited)
+    return { id, changed: false, report: stored };
+  const json = JSON.stringify(report);
+  transaction(db, () => {
+    writeReport.run(
+      row.path,
+      id,
+      row.fingerprint,
+      `${report.date}T${report.time}`,
+      report.line ?? null,
+      report.isAggregate ? 1 : 0,
+      json,
+      row.root,
+      report.testResults.length + report.segmentInfoList.length,
+    );
+    // Content changed, so the outbox appends a new sequence for the center.
+    enqueueReport(db, id, json, false);
+    changed(1);
+  });
+  publish();
+  return { id, changed: true, report };
+}
+
 async function dispatch(method, params) {
   if (closed && method !== "close") throw httpError(503, "报告索引已关闭");
   if (method === "query") return queryReports(params);
+  if (method === "editReport") return editStoredReport(params);
   if (method === "syncConfigure") {
     enqueueBaseline().catch((error) => { recordError(root, error); publish(); });
     return;

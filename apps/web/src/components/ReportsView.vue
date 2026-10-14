@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onUnmounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, reactive, ref, watch } from "vue";
 import {
   ArrowDownToLine,
   RefreshCw,
@@ -78,6 +78,9 @@ const images = ref([]);
 const imageOpen = ref(false);
 const loadedQuery = ref(null);
 const loadedAt = ref("");
+// Revision of the currently rendered page: an unchanged revision means the
+// background refresh has nothing to redraw.
+const loadedRevision = ref(null);
 const pageCount = computed(() =>
   Math.max(1, Math.ceil(total.value / query.pageSize)),
 );
@@ -232,11 +235,94 @@ async function copyColumn(index) {
     `已复制 ${sheet.label} ${column?.time || ""} 整列（${measured} 个测点 + 最大/平均/最小）`,
   );
 }
+// Corrections stay invisible: a double click turns an editable value into an
+// input, Enter or blur saves it, Escape cancels. Nothing in the page advertises
+// the feature, and there is no button, icon or menu for it. The server
+// re-derives the production line from a corrected sample name and the displayed
+// hardness statistics from a corrected measurement, then syncs the report to the
+// center as a new version.
+const editing = ref(null);
+const editError = ref("");
+const savingEdit = ref(false);
+let editFocus = null;
+const editableReports = computed(() => props.deploymentMode !== "server");
+function focusEditor() {
+  const target = editFocus;
+  editFocus = null;
+  nextTick(() => target?.querySelector?.(".cell-editor")?.focus());
+}
+function startEdit(report, field, index, current, event) {
+  // Only this machine's own reports can be corrected: rows merged from a paired
+  // peer carry a source id and are read-only here.
+  if (!editableReports.value || !report?.id || report.sourceId) return;
+  editError.value = "";
+  editFocus = event?.currentTarget ?? null;
+  editing.value = {
+    id: report.id,
+    field,
+    index,
+    text: current === null || current === undefined ? "" : String(current),
+  };
+  focusEditor();
+}
+function startMeasurementEdit(reportId, index, event) {
+  if (!editableReports.value || !reportId || !Number.isInteger(index)) return;
+  const report = reports.value.find((entry) => entry.id === reportId);
+  if (!report) return;
+  startEdit(report, "gram", index, report.testResults?.[index]?.gram, event);
+}
+function isEditing(id, field, index = null) {
+  const current = editing.value;
+  return (
+    Boolean(current) &&
+    current.id === id &&
+    current.field === field &&
+    (field === "gram" ? current.index === index : true)
+  );
+}
+function cancelEdit() {
+  editing.value = null;
+  editError.value = "";
+}
+async function commitEdit() {
+  const current = editing.value;
+  if (!current || savingEdit.value) return;
+  const raw = String(current.text ?? "").trim();
+  if (current.field === "sampleName" && !raw) {
+    editError.value = "样品名称不能为空";
+    return;
+  }
+  if (current.field === "gram" && (!raw || !Number.isFinite(Number(raw)))) {
+    editError.value = "强度必须为数值";
+    return;
+  }
+  const body =
+    current.field === "sampleName"
+      ? { id: current.id, sampleName: raw }
+      : { id: current.id, measurement: { index: current.index, gram: Number(raw) } };
+  savingEdit.value = true;
+  try {
+    await request("/reports/edit", {
+      method: "POST",
+      body,
+      localAdmin: true,
+      retries: 0,
+      timeout: 12_000,
+    });
+    editing.value = null;
+    editError.value = "";
+  } catch (cause) {
+    editError.value = cause.message;
+  } finally {
+    savingEdit.value = false;
+  }
+}
 const readyForActions = computed(() =>
   Boolean(loadedQuery.value && total.value > 0 && !indexing.value),
 );
 function displayResult(result, snapshot, savedAt, fromCache) {
   reports.value = result.reports;
+  loadedRevision.value = result.revision ?? null;
   transient.value = Boolean(props.transientReports || result.transient);
   sources.value = result.sources || [];
   sourceWarnings.value = result.warnings || [];
@@ -314,13 +400,18 @@ async function releaseLease() {
     /* Pagehide/unmount cannot safely retry a release. */
   }
 }
-async function loadReports() {
+async function loadReports({ silent = false } = {}) {
   const snapshot = { ...query };
   const key = pageKey(snapshot);
   if (loading.value && activeKey === key) {
     pendingRefresh = true;
     return;
   }
+  // A background refresh (revision change, reconnect, periodic status) must not
+  // touch the visible state: no loading flag, no spinner, no "更新中" caption and
+  // no clearing of the table, so nothing on screen blinks. Only a genuine data
+  // change (different revision) replaces the rows.
+  const background = silent && Boolean(loadedQuery.value) && key === activeKey;
   if (key !== activeKey) {
     controller?.abort();
     reports.value = [];
@@ -342,8 +433,8 @@ async function loadReports() {
   }
   controller = new AbortController();
   const signal = controller.signal;
-  loading.value = true;
-  error.value = "";
+  if (!background) loading.value = true;
+  if (!background) error.value = "";
   try {
     if (!loadedQuery.value && cacheAllowed.value) {
       const saved = await readReportPage(props.cacheScope, snapshot);
@@ -372,6 +463,15 @@ async function loadReports() {
       window.dispatchEvent(new Event("lizi:data-root-changed"));
       return;
     }
+    // Same revision means the same data: leave the rendered table untouched.
+    if (
+      background &&
+      loadedRevision.value !== null &&
+      result.revision === loadedRevision.value
+    ) {
+      loadedAt.value = new Date().toLocaleString("zh-CN");
+      return;
+    }
     displayResult(result, snapshot, Date.now(), false);
     scheduleLease();
     if (snapshot.page > pageCount.value && !result.indexing) {
@@ -385,7 +485,7 @@ async function loadReports() {
       error.value = cause.message;
   } finally {
     if (current === sequence) {
-      loading.value = false;
+      if (!background) loading.value = false;
       if (
         pendingRefresh &&
         props.online &&
@@ -393,7 +493,7 @@ async function loadReports() {
         document.visibilityState === "visible"
       ) {
         pendingRefresh = false;
-        queueMicrotask(loadReports);
+        queueMicrotask(() => loadReports({ silent: true }));
       }
     }
   }
@@ -428,14 +528,15 @@ watch(
 watch(
   () => [props.refreshKey, props.online],
   () => {
-    if (props.active && document.visibilityState === "visible") loadReports();
+    if (props.active && document.visibilityState === "visible")
+      loadReports({ silent: true });
     else pendingRefresh = true;
   },
 );
 watch(
   () => props.active,
   (active) => {
-    if (active && pendingRefresh) loadReports();
+    if (active && pendingRefresh) loadReports({ silent: true });
     if (active) scheduleLease();
     else releaseLease();
   },
@@ -443,7 +544,7 @@ watch(
 function resume() {
   if (document.visibilityState === "visible") {
     scheduleLease();
-    if (props.active && pendingRefresh) loadReports();
+    if (props.active && pendingRefresh) loadReports({ silent: true });
   } else releaseLease();
 }
 document.addEventListener("visibilitychange", resume);
@@ -820,6 +921,9 @@ onUnmounted(() => {
     <p v-if="error && reports.length" role="alert" class="error-message">
       更新未完成：{{ error }}。下方保留上次报告。
     </p>
+    <p v-if="editError" role="alert" class="error-message">
+      修改未保存：{{ editError }}
+    </p>
     <div
       v-if="error && !reports.length"
       role="alert"
@@ -910,8 +1014,35 @@ onUnmounted(() => {
               <tbody>
                 <tr v-for="(row, rowIndex) in activeSheet.rows" :key="rowIndex">
                   <td class="row-label">{{ rowIndex + 1 }}</td>
-                  <td v-for="(value, columnIndex) in row" :key="columnIndex">
-                    {{ showValue(value) }}
+                  <td
+                    v-for="(value, columnIndex) in row"
+                    :key="columnIndex"
+                    class="measurement-cell"
+                    @dblclick="
+                      startMeasurementEdit(
+                        activeSheet.columns[columnIndex]?.id,
+                        activeSheet.columns[columnIndex]?.indexes?.[rowIndex],
+                        $event,
+                      )
+                    "
+                  >
+                    <input
+                      v-if="
+                        isEditing(
+                          activeSheet.columns[columnIndex]?.id,
+                          'gram',
+                          activeSheet.columns[columnIndex]?.indexes?.[rowIndex],
+                        )
+                      "
+                      v-model="editing.text"
+                      class="cell-editor"
+                      type="text"
+                      inputmode="numeric"
+                      @keydown.enter.prevent="commitEdit"
+                      @keydown.esc.prevent="cancelEdit"
+                      @blur="commitEdit"
+                    />
+                    <template v-else>{{ showValue(value) }}</template>
                   </td>
                 </tr>
                 <tr
@@ -985,12 +1116,28 @@ onUnmounted(() => {
                 <td>{{ report.date }}</td>
                 <td>{{ report.time }}</td>
                 <td>{{ showValue(report.line) }}</td>
-                <td class="sample-cell">
-                  <span
-                    v-if="report.isAggregate"
-                    class="aggregate-dot"
-                    title="总分析"
-                  />{{ report.sampleName }}
+                <td
+                  class="sample-cell"
+                  @dblclick="
+                    startEdit(report, 'sampleName', null, report.sampleName, $event)
+                  "
+                >
+                  <input
+                    v-if="isEditing(report.id, 'sampleName')"
+                    v-model="editing.text"
+                    class="cell-editor"
+                    type="text"
+                    @keydown.enter.prevent="commitEdit"
+                    @keydown.esc.prevent="cancelEdit"
+                    @blur="commitEdit"
+                  />
+                  <template v-else>
+                    <span
+                      v-if="report.isAggregate"
+                      class="aggregate-dot"
+                      title="总分析"
+                    />{{ report.sampleName }}
+                  </template>
                 </td>
                 <td>{{ report.sourceName || report.sourceId || "本机" }}<span v-if="report.instrumentId"> · {{ report.instrumentId }}</span></td>
                 <td>{{ showValue(report.maxHardness) }}</td>
@@ -999,8 +1146,33 @@ onUnmounted(() => {
                 </td>
                 <td>{{ showValue(report.minHardness) }}</td>
                 <template v-if="showDetails">
-                  <td v-for="index in testsCount" :key="index">
-                    {{ showValue(report.testResults?.[index - 1]?.gram) }}
+                  <td
+                    v-for="index in testsCount"
+                    :key="index"
+                    class="measurement-cell"
+                    @dblclick="
+                      startEdit(
+                        report,
+                        'gram',
+                        index - 1,
+                        report.testResults?.[index - 1]?.gram,
+                        $event,
+                      )
+                    "
+                  >
+                    <input
+                      v-if="isEditing(report.id, 'gram', index - 1)"
+                      v-model="editing.text"
+                      class="cell-editor"
+                      type="text"
+                      inputmode="numeric"
+                      @keydown.enter.prevent="commitEdit"
+                      @keydown.esc.prevent="cancelEdit"
+                      @blur="commitEdit"
+                    />
+                    <template v-else>{{
+                      showValue(report.testResults?.[index - 1]?.gram)
+                    }}</template>
                   </td>
                 </template>
                 <td>

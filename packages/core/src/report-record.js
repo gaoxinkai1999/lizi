@@ -2,11 +2,13 @@
 // order, twenty measurement rows sorted descending, and a per-column summary.
 export const MEASUREMENT_ROWS = 20;
 
-function measurementValues(report) {
+// Measurement rows sorted descending, keeping the index of each value inside the
+// report's own testResults so a correction can target the exact measurement.
+function measurementEntries(report) {
   return (report.testResults || [])
-    .map((item) => item.gram)
-    .filter((value) => Number.isFinite(value))
-    .sort((a, b) => b - a);
+    .map((item, index) => ({ index, value: item.gram }))
+    .filter((entry) => Number.isFinite(entry.value))
+    .sort((a, b) => b.value - a.value || a.index - b.index);
 }
 
 function lineKey(report) {
@@ -52,7 +54,8 @@ export function buildRecordSheets(reports = []) {
     .sort(([a], [b]) => compareLines(a, b))
     .map(([key, items]) => {
       const columns = [...items].sort(compareChronological);
-      const values = columns.map(measurementValues);
+      const entries = columns.map(measurementEntries);
+      const values = entries.map((column) => column.map((entry) => entry.value));
       const rows = Array.from({ length: MEASUREMENT_ROWS }, (_, index) =>
         values.map((column) => column[index] ?? null),
       );
@@ -75,10 +78,13 @@ export function buildRecordSheets(reports = []) {
         label: recordLabel(key),
         title: `${recordLabel(key)}粒子强度记录表`,
         date: columns[0]?.date ?? "",
-        columns: columns.map((report) => ({
+        columns: columns.map((report, index) => ({
           id: report.id,
           time: shortTime(report.time),
           sampleName: report.sampleName,
+          // testResults index per displayed row, so an edited cell maps back to
+          // the exact measurement.
+          indexes: entries[index].map((entry) => entry.index),
         })),
         rows,
         summary,

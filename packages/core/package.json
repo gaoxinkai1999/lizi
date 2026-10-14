@@ -1,6 +1,6 @@
 {
   "name": "@lizi/core",
-  "version": "3.1.3",
+  "version": "3.1.5",
   "private": true,
   "type": "module",
   "exports": "./src/index.js",

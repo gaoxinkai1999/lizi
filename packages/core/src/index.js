@@ -136,9 +136,7 @@ export function parseReport(content) {
       .slice(4)
       .map((part) => part.padStart(2, "0"))
       .join(":"),
-    line: /^(\d+)(?=\D|$)/.test(sampleName)
-      ? Number(/^(\d+)/.exec(sampleName)[1])
-      : null,
+    line: sampleLine(sampleName),
     sampleName,
     operator: extract("Operator"),
     cup: numeric("CUP"),
@@ -161,7 +159,7 @@ export function parseReport(content) {
     step: numeric("STEP"),
     testResults: [],
     segmentInfoList: [],
-    isAggregate: /总|z/i.test(sampleName),
+    isAggregate: isAggregateSample(sampleName),
   };
   const [measurements, segments = text] = text.split(/Segment Analysis/i);
   const pattern = new RegExp(
@@ -188,6 +186,92 @@ export function parseReport(content) {
     });
   }
   return report;
+}
+
+// The production line and the aggregate flag are derived from the sample name
+// (leading digits, plus a "总"/"z" marker). Shared with the correction path so a
+// corrected name re-derives exactly what the parser would have produced.
+export function sampleLine(sampleName) {
+  const name = typeof sampleName === "string" ? sampleName : "";
+  return /^(\d+)(?=\D|$)/.test(name) ? Number(/^(\d+)/.exec(name)[1]) : null;
+}
+
+export function isAggregateSample(sampleName) {
+  return /总|z/i.test(typeof sampleName === "string" ? sampleName : "");
+}
+
+export const REPORT_EDIT_NAME_LIMIT = 120;
+export const REPORT_EDIT_GRAM_MIN = 0;
+export const REPORT_EDIT_GRAM_MAX = 100000;
+
+// The three displayed hardness statistics, recomputed from the measurement rows
+// so a corrected value stays consistent with the table. Instrument-reported
+// metrics that cannot be recomputed (deviations, top-25% figures, diameters)
+// keep the values the instrument produced.
+export function hardnessSummary(testResults) {
+  const values = (Array.isArray(testResults) ? testResults : [])
+    .map((row) => Number(row?.gram))
+    .filter((value) => Number.isFinite(value));
+  if (!values.length)
+    return { maxHardness: null, averageHardness: null, minHardness: null };
+  return {
+    maxHardness: Math.round(Math.max(...values)),
+    averageHardness: Math.round(
+      values.reduce((total, value) => total + value, 0) / values.length,
+    ),
+    minHardness: Math.round(Math.min(...values)),
+  };
+}
+
+// Applies a maintainer correction to a parsed report: a new sample name (which
+// re-derives the production line and the aggregate flag) or one measurement
+// value (which re-derives the displayed hardness statistics). Returns a copy;
+// the caller decides whether to persist it.
+export function applyReportEdit(report, edit = {}) {
+  if (!report || typeof report !== "object") throw new Error("报告数据无效");
+  const next = { ...report };
+  let changed = false;
+  if (edit.sampleName !== undefined) {
+    if (typeof edit.sampleName !== "string")
+      throw new Error("样品名称必须为文本");
+    const sampleName = edit.sampleName.trim();
+    if (!sampleName) throw new Error("样品名称不能为空");
+    if (sampleName.length > REPORT_EDIT_NAME_LIMIT)
+      throw new Error(`样品名称不能超过 ${REPORT_EDIT_NAME_LIMIT} 个字符`);
+    if (/[\u0000-\u001f\u007f]/.test(sampleName))
+      throw new Error("样品名称包含不可用字符");
+    if (sampleName !== report.sampleName) {
+      next.sampleName = sampleName;
+      next.line = sampleLine(sampleName);
+      next.isAggregate = isAggregateSample(sampleName);
+      changed = true;
+    }
+  }
+  if (edit.measurement !== undefined && edit.measurement !== null) {
+    const { index, gram } = edit.measurement;
+    if (!Number.isInteger(index) || index < 0)
+      throw new Error("测点序号无效");
+    const rows = Array.isArray(next.testResults) ? next.testResults : [];
+    if (index >= rows.length) throw new Error("测点序号超出报告范围");
+    const value = Number(gram);
+    if (
+      !Number.isFinite(value) ||
+      value < REPORT_EDIT_GRAM_MIN ||
+      value > REPORT_EDIT_GRAM_MAX
+    )
+      throw new Error(
+        `强度必须为 ${REPORT_EDIT_GRAM_MIN}–${REPORT_EDIT_GRAM_MAX} 之间的数值`,
+      );
+    const rounded = Math.round(value);
+    if (rows[index].gram !== rounded) {
+      next.testResults = rows.map((row, position) =>
+        position === index ? { ...row, gram: rounded } : row,
+      );
+      Object.assign(next, hardnessSummary(next.testResults));
+      changed = true;
+    }
+  }
+  return { report: next, changed };
 }
 
 export const reportColumns = [
