@@ -183,6 +183,55 @@ function showSheet(index) {
 function recordSummary(key) {
   return { max: "最大", average: "平均", min: "最小" }[key];
 }
+// Clicking a column header copies that whole column (one report): the twenty
+// measurements in display order plus the 最大/平均/最小 rows, one per line, so it
+// pastes straight into a spreadsheet column.
+const copiedHint = ref("");
+let copiedTimer = null;
+function flashCopied(message) {
+  copiedHint.value = message;
+  clearTimeout(copiedTimer);
+  copiedTimer = setTimeout(() => {
+    copiedHint.value = "";
+  }, 2000);
+}
+function columnText(index) {
+  const sheet = activeSheet.value;
+  if (!sheet) return "";
+  const values = sheet.rows.map((row) => row[index] ?? "");
+  const summary = ["max", "average", "min"].map(
+    (key) => sheet.summary[key][index] ?? "",
+  );
+  return [...values, ...summary].join("\n");
+}
+async function copyColumn(index) {
+  const sheet = activeSheet.value;
+  if (!sheet) return;
+  const column = sheet.columns[index];
+  const text = columnText(index);
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+    else throw new Error("clipboard unavailable");
+  } catch {
+    const field = document.createElement("textarea");
+    field.value = text;
+    field.setAttribute("readonly", "");
+    field.style.position = "fixed";
+    field.style.opacity = "0";
+    document.body.appendChild(field);
+    field.select();
+    try {
+      document.execCommand("copy");
+    } catch {
+      /* The hint below still reports what was attempted. */
+    }
+    field.remove();
+  }
+  const measured = sheet.rows.filter((row) => row[index] !== null).length;
+  flashCopied(
+    `已复制 ${sheet.label} ${column?.time || ""} 整列（${measured} 个测点 + 最大/平均/最小）`,
+  );
+}
 const readyForActions = computed(() =>
   Boolean(loadedQuery.value && total.value > 0 && !indexing.value),
 );
@@ -831,6 +880,7 @@ onUnmounted(() => {
         </div>
         <div class="record-sheet">
           <h2>{{ activeSheet.title }}</h2>
+          <p v-if="copiedHint" class="copy-hint" role="status">{{ copiedHint }}</p>
           <div class="record-table-wrap">
             <table>
               <thead>
@@ -840,7 +890,13 @@ onUnmounted(() => {
                 </tr>
                 <tr>
                   <th class="row-label">时间</th>
-                  <th v-for="column in activeSheet.columns" :key="column.id">
+                  <th
+                    v-for="(column, index) in activeSheet.columns"
+                    :key="column.id"
+                    class="copy-column"
+                    title="单击复制整列"
+                    @click="copyColumn(index)"
+                  >
                     {{ column.time }}
                   </th>
                 </tr>
