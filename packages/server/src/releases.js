@@ -15,6 +15,7 @@ import {
   compareReleaseVersions,
   isValidReleaseSignature,
   isValidReleaseVersion,
+  validateReleaseArtifactUrl,
   validateReleaseManifest,
   verifyManifestSignature,
 } from "../../core/src/release-verification.js";
@@ -57,6 +58,12 @@ function assertReleaseRecord(version, record, publicKey) {
     throw new Error(`发布索引中的 ${version} 状态无效`);
   if (typeof record.artifactPath !== "string" || path.isAbsolute(record.artifactPath))
     throw new Error(`发布索引中的 ${version} 安装包路径无效`);
+  // artifactUrl is optional: older records have no mirror and are served from
+  // the center itself.
+  const artifactUrl =
+    record.artifactUrl === undefined || record.artifactUrl === null
+      ? null
+      : validateReleaseArtifactUrl(record.artifactUrl);
   return {
     manifest,
     signature: record.signature,
@@ -66,6 +73,7 @@ function assertReleaseRecord(version, record, publicKey) {
       typeof record.withdrawnAt === "string" ? record.withdrawnAt : null,
     uploadedAt: typeof record.uploadedAt === "string" ? record.uploadedAt : null,
     artifactPath: record.artifactPath,
+    artifactUrl,
   };
 }
 
@@ -138,7 +146,7 @@ export async function createReleases(options) {
       ...record.manifest,
       status: record.status,
       withdrawnAt: record.withdrawnAt,
-      url: `/api/releases/${version}/download`,
+      url: record.artifactUrl ?? `/api/releases/${version}/download`,
     };
   }
 
@@ -257,7 +265,13 @@ export async function createReleases(options) {
     );
     res.json({
       release: found
-        ? { manifest: found[1].manifest, signature: found[1].signature }
+        ? {
+            manifest: found[1].manifest,
+            signature: found[1].signature,
+            // Where the client should download from. Object storage keeps the
+            // center's metered uplink out of the update path entirely.
+            url: found[1].artifactUrl ?? `/api/releases/${found[0]}/download`,
+          }
         : null,
     });
   });
@@ -268,6 +282,10 @@ export async function createReleases(options) {
       : undefined;
     if (!record || record.status !== "published")
       throw httpError(404, "安装包不存在");
+    // Deliberately not a redirect to the mirror: clients already deployed fetch
+    // this endpoint with redirect:"error", so a 302 would break their updates.
+    // They keep streaming from here at the center's uplink speed; clients built
+    // from 3.1.3 on prefer the object-storage URL from /latest.
     const absolute = path.join(releasesRoot, record.artifactPath);
     if (!isWithin(releasesRoot, absolute))
       throw httpError(404, "安装包不存在");
@@ -296,10 +314,13 @@ export async function createReleases(options) {
     });
   });
   adminRouter.post("/", async (req, res) => {
-    const { manifest, signature } = req.body ?? {};
+    const { manifest, signature, artifactUrl } = req.body ?? {};
     let canonical;
+    let mirror = null;
     try {
       canonical = validateReleaseManifest(manifest);
+      if (artifactUrl !== undefined && artifactUrl !== null)
+        mirror = validateReleaseArtifactUrl(artifactUrl);
     } catch (error) {
       throw httpError(400, error.message);
     }
@@ -342,6 +363,7 @@ export async function createReleases(options) {
         withdrawnAt: null,
         uploadedAt: new Date().toISOString(),
         artifactPath: path.relative(releasesRoot, target),
+        artifactUrl: mirror,
       };
       const nextRecords = new Map(records);
       nextRecords.set(version, created);

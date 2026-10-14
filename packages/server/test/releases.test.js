@@ -17,6 +17,7 @@ import { createAuth, hashPassword, requireSameOrigin } from "../src/auth.js";
 import { httpError } from "../src/directories.js";
 import { createReleases } from "../src/releases.js";
 import {
+  RELEASE_MIRROR_HOSTS,
   canonicalManifestBytes,
   compareReleaseVersions,
   expectedReleaseFilename,
@@ -350,6 +351,57 @@ test("withdrawing the latest release falls back to the previous stable version",
     list.releases.map((entry) => entry.version),
     ["3.1.0", "3.0.1"].sort(compareReleaseVersions).reverse(),
   );
+});
+
+test("mirrored releases publish, list and favour object storage over the center uplink", async (t) => {
+  const f = await fixture(t);
+  const payload = randomBytes(2048);
+  const mirror = `https://${RELEASE_MIRROR_HOSTS[0]}/releases/Lizi-Setup-3.1.0-x64.exe`;
+  assert.equal((await f.upload("3.1.0", payload)).status, 201);
+  const published = await f.publish({ ...f.sign(payload, "3.1.0"), artifactUrl: mirror });
+  assert.equal(published.status, 201);
+
+  const latest = await (await fetch(`${f.origin}/api/releases/latest?platform=win32&arch=x64`)).json();
+  assert.equal(latest.release.url, mirror);
+  assert.equal(latest.release.manifest.version, "3.1.0");
+
+  // The center keeps serving the bytes itself so clients that predate the
+  // mirror support (redirect:"error") are not broken by a redirect.
+  const streamedFromCenter = await fetch(`${f.origin}/api/releases/3.1.0/download`);
+  assert.equal(streamedFromCenter.status, 200);
+  assert.equal(streamedFromCenter.headers.get("location"), null);
+  assert.deepEqual(Buffer.from(await streamedFromCenter.arrayBuffer()), payload);
+
+  const list = await (
+    await fetch(`${f.origin}/api/releases`, { headers: { Cookie: f.adminCookie } })
+  ).json();
+  assert.equal(list.latest.url, mirror);
+
+  // A host outside the pinned mirror list is refused at publication time.
+  const rejected = await f.publish({
+    ...f.sign(randomBytes(16), "3.2.0"),
+    artifactUrl: "https://evil.example/Lizi-Setup-3.2.0-x64.exe",
+  });
+  assert.equal(rejected.status, 400);
+
+  // Releases without a mirror keep streaming from the center.
+  const local = (await f.put(randomBytes(1024), "3.0.1")).release;
+  assert.equal(local.url, "/api/releases/3.0.1/download");
+  const streamed = await fetch(`${f.origin}/api/releases/3.0.1/download`);
+  assert.equal(streamed.status, 200);
+});
+
+test("a mirrored release rejected after upload leaves nothing published", async (t) => {
+  const f = await fixture(t);
+  const payload = randomBytes(1024);
+  assert.equal((await f.upload("3.1.0", payload)).status, 201);
+  const rejected = await f.publish({
+    ...f.sign(payload, "3.1.0"),
+    artifactUrl: "https://evil.example/x.exe",
+  });
+  assert.equal(rejected.status, 400);
+  const latest = await (await fetch(`${f.origin}/api/releases/latest`)).json();
+  assert.equal(latest.release, null);
 });
 
 test("public latest is signed and survives a store restart while staged temp is dropped", async (t) => {

@@ -24,6 +24,15 @@ export const RELEASE_ARCH = "x64";
 export const RELEASE_NOTES_LIMIT = 2000;
 export const RELEASE_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024;
 export const RELEASE_VERSION_LIMIT = 32;
+export const RELEASE_ARTIFACT_URL_LIMIT = 512;
+
+// Installers may be served from object storage instead of the center's own
+// uplink. Both sides pin the exact hosts allowed to serve an artifact, so a
+// release index (or a compromised center) cannot point clients at another host;
+// the signed SHA256 still has to match whatever is downloaded.
+export const RELEASE_MIRROR_HOSTS = Object.freeze([
+  "lizi-release-1317280880.cos.ap-beijing.myqcloud.com",
+]);
 
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -45,6 +54,31 @@ export function expectedReleaseFilename(version, arch = RELEASE_ARCH) {
   if (!isValidReleaseVersion(version)) throw new Error("版本号无效");
   if (arch !== RELEASE_ARCH) throw new Error("不支持的处理器架构");
   return `Lizi-Setup-${version}-${arch}.exe`;
+}
+
+// Accepts only an absolute HTTPS URL on a pinned mirror host, with no
+// credentials, port or query, so the value stored in a release record is always
+// a plain object-storage link.
+export function validateReleaseArtifactUrl(value) {
+  if (typeof value !== "string" || value.length === 0)
+    throw new Error("安装包下载地址必须为字符串");
+  if (value.length > RELEASE_ARTIFACT_URL_LIMIT)
+    throw new Error("安装包下载地址过长");
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("安装包下载地址不是合法 URL");
+  }
+  if (url.protocol !== "https:") throw new Error("安装包下载地址必须使用 HTTPS");
+  if (url.username || url.password) throw new Error("安装包下载地址不得包含凭据");
+  if (url.port) throw new Error("安装包下载地址不得指定端口");
+  if (url.search || url.hash) throw new Error("安装包下载地址不得包含查询或片段");
+  if (!RELEASE_MIRROR_HOSTS.includes(url.hostname))
+    throw new Error("安装包下载地址主机不在允许列表内");
+  if (!/^\/[A-Za-z0-9._\-/]+$/.test(url.pathname))
+    throw new Error("安装包下载地址路径无效");
+  return value;
 }
 
 // Rebuilds the manifest with exactly the canonical fields in their fixed order.

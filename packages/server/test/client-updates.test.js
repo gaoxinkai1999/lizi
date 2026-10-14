@@ -224,6 +224,73 @@ test("client rejects an oversized latest response", async (t) => {
   assert.match(result.error, /过大/);
 });
 
+test("client downloads from the pinned mirror host and falls back to the center", async (t) => {
+  const keys = generateKeyPairSync("ed25519");
+  const publicKey = keys.publicKey.export({ type: "spki", format: "pem" });
+  const payload = randomBytes(8192);
+  const manifest = buildManifest("3.1.0", payload);
+  const mirror = "https://lizi-release-1317280880.cos.ap-beijing.myqcloud.com/releases/Lizi-Setup-3.1.0-x64.exe";
+
+  // Happy path: latest advertises the mirror and the download never touches the
+  // center uplink.
+  const hits = [];
+  const mirrored = await manager(t, {
+    currentVersion: "3.0.0",
+    publicKey,
+    fetchImpl: async (url) => {
+      hits.push(url);
+      if (url.includes("/api/releases/latest"))
+        return fakeResponse({ url, json: { release: { ...signedRelease(manifest, keys.privateKey), url: mirror } } });
+      if (url === mirror)
+        return fakeResponse({ url, body: new Response(payload).body, contentLength: payload.length });
+      throw new Error(`unexpected ${url}`);
+    },
+  });
+  assert.equal((await mirrored.instance.check()).latest.artifactUrl, mirror);
+  const ready = await mirrored.instance.download();
+  assert.equal(ready.state, "ready");
+  assert.deepEqual(await fs.readFile(path.join(mirrored.userData, "updates", manifest.filename)), payload);
+  assert.deepEqual(hits.filter((url) => url.startsWith(CENTER)), [`${CENTER}/api/releases/latest?platform=win32&arch=x64`]);
+
+  // An unpinned mirror host is ignored and the center serves the bytes.
+  const untrusted = await manager(t, {
+    currentVersion: "3.0.0",
+    publicKey,
+    fetchImpl: async (url) => {
+      if (url.includes("/api/releases/latest"))
+        return fakeResponse({ url, json: { release: { ...signedRelease(manifest, keys.privateKey), url: "https://evil.example/Lizi-Setup-3.1.0-x64.exe" } } });
+      return fakeResponse({ url, body: new Response(payload).body, contentLength: payload.length });
+    },
+  });
+  assert.equal((await untrusted.instance.check()).latest.artifactUrl, null);
+  assert.equal((await untrusted.instance.download()).state, "ready");
+
+  // Mirror dies mid-download: the remainder is fetched from the center with a
+  // Range request and the concatenation still matches the signed hash.
+  const cut = 3000;
+  const resumed = await manager(t, {
+    currentVersion: "3.0.0",
+    publicKey,
+    fetchImpl: async (url, options) => {
+      if (url.includes("/api/releases/latest"))
+        return fakeResponse({ url, json: { release: { ...signedRelease(manifest, keys.privateKey), url: mirror } } });
+      if (url === mirror) {
+        const truncated = new Response(payload.subarray(0, cut)).body;
+        return { ...fakeResponse({ url, body: truncated, contentLength: cut }), ok: true, status: 500 };
+      }
+      assert.equal(options.headers.range, `bytes=${cut}-`);
+      return {
+        ...fakeResponse({ url, body: new Response(payload.subarray(cut)).body, contentLength: payload.length - cut }),
+        status: 206,
+      };
+    },
+  });
+  await resumed.instance.check();
+  const finished = await resumed.instance.download();
+  assert.equal(finished.state, "ready", finished.error);
+  assert.deepEqual(await fs.readFile(path.join(resumed.userData, "updates", manifest.filename)), payload);
+});
+
 test("installer exit codes map to launch, UAC cancel and verification failures", () => {
   assert.deepEqual(installerOutcome(0), { ok: true });
   assert.deepEqual(installerOutcome(1223), { cancelled: true });

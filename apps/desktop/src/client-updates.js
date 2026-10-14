@@ -2,10 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
+import { once } from "node:events";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { pipeline } from "node:stream/promises";
-import { Transform } from "node:stream";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CHECK_TIMEOUT = 15000;
@@ -185,23 +184,33 @@ export async function hashFile(file) {
   return { size, sha256: hash.digest("hex") };
 }
 
-class DownloadLimiter extends Transform {
-  constructor(expected, onProgress) {
-    super();
+// Hashes and counts every byte while writing it, so the final digest covers the
+// whole file even when one download comes from two sources (object storage and
+// the center fallback). A stream Transform cannot be reused across segments —
+// a second pipeline into an ended Transform never settles — hence the explicit
+// read/write loop.
+class ArtifactHasher {
+  constructor(expectedSize, onProgress) {
+    this.expectedSize = expectedSize;
+    this.onProgress = onProgress;
+    this.reset();
+  }
+  reset() {
     this.hash = createHash("sha256");
     this.size = 0;
-    this.expected = expected;
-    this.onProgress = onProgress;
   }
-  _transform(chunk, _encoding, callback) {
-    this.size += chunk.length;
-    if (this.size > this.expected) {
-      callback(new Error("安装包超过发布清单声明的大小"));
-      return;
+  async absorb(body, sink) {
+    for await (const chunk of body) {
+      this.size += chunk.length;
+      if (this.size > this.expectedSize)
+        throw new Error("安装包超过发布清单声明的大小");
+      this.hash.update(chunk);
+      this.onProgress(this.size);
+      if (!sink.write(chunk)) await once(sink, "drain");
     }
-    this.hash.update(chunk);
-    this.onProgress(this.size);
-    callback(null, chunk);
+    await new Promise((resolve, reject) =>
+      sink.end((error) => (error ? reject(error) : resolve())),
+    );
   }
   digest() {
     return this.hash.digest("hex");
@@ -218,6 +227,7 @@ export async function createUpdateManager({
   const { CENTER_URL } = deployment;
   const {
     isNewerReleaseVersion,
+    validateReleaseArtifactUrl,
     validateReleaseManifest,
     verifyManifestSignature,
   } = verification;
@@ -299,9 +309,10 @@ export async function createUpdateManager({
 
   async function request(url, options) {
     const response = await fetchImpl(url, { redirect: "error", ...options });
-    // redirect:"error" already rejects redirects; refuse any off-origin answer
-    // so a manipulated proxy cannot redirect downloads to another host.
-    if (new URL(response.url).origin !== centerOrigin)
+    // redirect:"error" already rejects redirects; additionally require the
+    // answer to come from the origin we asked. The object-storage host is
+    // acceptable only because check() validated it against the pinned list.
+    if (new URL(response.url).origin !== new URL(url).origin)
       throw new Error("中心响应来源异常");
     return response;
   }
@@ -341,6 +352,17 @@ export async function createUpdateManager({
       }
       if (!verifyManifestSignature(manifest, release.signature, pinnedKey))
         throw new Error("发布签名未通过固定公钥校验");
+      // Object storage speeds updates up roughly twenty-fold, but it is not
+      // load-bearing: an absent, malformed or rejected address means the
+      // download simply goes through the center.
+      let artifactUrl = null;
+      if (typeof release.url === "string" && release.url.startsWith("https://")) {
+        try {
+          artifactUrl = validateReleaseArtifactUrl(release.url);
+        } catch (error) {
+          console.error("忽略无效的安装包下载地址：", error.message);
+        }
+      }
       if (!isNewerReleaseVersion(manifest.version, currentVersion)) {
         downloaded = null;
         return setStatus({
@@ -355,7 +377,7 @@ export async function createUpdateManager({
       downloaded = null;
       return setStatus({
         state: "available",
-        latest: latestDescriptor(manifest),
+        latest: { ...latestDescriptor(manifest), artifactUrl },
         downloaded: null,
         ready: false,
         progress: null,
@@ -404,31 +426,80 @@ export async function createUpdateManager({
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => controller.abort(), DOWNLOAD_IDLE_TIMEOUT);
     };
-    const limiter = new DownloadLimiter(latest.size, (received) => {
+    // The mirror is the fast path (object storage, resumable), the center the
+    // fallback. `partial` counts bytes already on disk that the center may skip.
+    let partial = 0;
+    const hasher = new ArtifactHasher(latest.size, (count) => {
       bumpIdle();
       status.progress = {
-        received,
+        received: count,
         total: latest.size,
-        percent: Math.min(100, Math.round((received / latest.size) * 100)),
+        percent: Math.min(100, Math.round((count / latest.size) * 100)),
       };
       publish();
     });
+    async function fetchFrom(url, { range }) {
+      const headers = { accept: "application/octet-stream" };
+      if (range) headers.range = `bytes=${range.from}-`;
+      const response = await request(url, { headers, signal: controller.signal });
+      if (!response.ok) throw new Error(`下载源返回 ${response.status}`);
+      return { response, resume: range !== undefined && response.status === 206 };
+    }
+    async function writeSegment(body, { append }) {
+      const sink = createWriteStream(temporary, {
+        flags: append ? "a" : "w",
+        mode: 0o600,
+      });
+      try {
+        await hasher.absorb(body, sink);
+      } catch (error) {
+        sink.destroy();
+        await once(sink, "close").catch(() => {});
+        throw error;
+      }
+    }
+    // Replays the bytes already on disk through the hash before the remainder
+    // arrives, without loading the (possibly 150 MB) partial file into memory.
+    async function hashPartial() {
+      hasher.reset();
+      for await (const chunk of createReadStream(temporary)) {
+        hasher.size += chunk.length;
+        hasher.hash.update(chunk);
+      }
+    }
     try {
-      const response = await request(
-        `${CENTER_URL}/api/releases/${encodeURIComponent(latest.version)}/download`,
-        {
-          headers: { accept: "application/octet-stream" },
-          signal: controller.signal,
-        },
-      );
-      if (!response.ok) throw new Error(`中心返回 ${response.status}`);
-      const declared = Number(response.headers.get("content-length"));
-      if (Number.isSafeInteger(declared) && declared > 0 && declared !== latest.size)
+      if (latest.artifactUrl) {
+        try {
+          const { response } = await fetchFrom(latest.artifactUrl, {});
+          await writeSegment(response.body, { append: false });
+          if (hasher.size < latest.size) partial = hasher.size;
+        } catch (error) {
+          if (error.name === "AbortError" || error.name === "TimeoutError") throw error;
+          console.error("对象存储下载失败，回退中心：", error.message);
+          // Whatever the mirror delivered is discarded: the center request then
+          // starts from zero instead of resuming a file that may be unusable.
+          await fs.rm(temporary, { force: true }).catch(() => {});
+          hasher.reset();
+          partial = 0;
+        }
+      }
+      if (hasher.size !== latest.size) {
+        const { response, resume } = await fetchFrom(
+          `${CENTER_URL}/api/releases/${encodeURIComponent(latest.version)}/download`,
+          { range: partial > 0 ? { from: partial } : undefined },
+        );
+        if (resume) {
+          await hashPartial();
+          await writeSegment(response.body, { append: true });
+        } else {
+          if (partial > 0) await fs.rm(temporary, { force: true }).catch(() => {});
+          hasher.reset();
+          await writeSegment(response.body, { append: false });
+        }
+      }
+      if (hasher.size !== latest.size)
         throw new Error("安装包长度与发布清单不一致");
-      await pipeline(response.body, limiter, createWriteStream(temporary, { mode: 0o600 }));
-      if (limiter.size !== latest.size)
-        throw new Error("安装包长度与发布清单不一致");
-      if (limiter.digest() !== latest.sha256)
+      if (hasher.digest() !== latest.sha256)
         throw new Error("安装包 SHA256 与发布清单不一致");
       const handle = await fs.open(temporary, "r+");
       try {
