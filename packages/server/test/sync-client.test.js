@@ -648,3 +648,41 @@ test("ACK persistence and metric read failures retain event and recover without 
   await until(() => f.client.getStatus().pending === 0);
   assert.equal(f.client.getStatus().queueMetricsStale, false);
 });
+
+test("heartbeat edits are applied to the local report and uploaded as a new version", async (t) => {
+  const acks = [];
+  const batches = [];
+  const pending = [];
+  const { url } = await serverFixture(t,
+    ({ request, response, body }) => {
+      if (request.url.endsWith("/edits/ack")) {
+        acks.push(body);
+        respond(response, { protocolVersion: 1, deviceId: body.deviceId, accepted: body.results.length });
+        return;
+      }
+      batches.push(body);
+      respond(response, ack(body));
+    },
+    ({ response, body }) => respond(response, { protocolVersion: 1, deviceId: body.deviceId, registrationState: "approved", edits: pending.slice() }));
+  const f = await fixture(t, url, { realStore: true });
+  await f.client.start();
+  await stableWrite(path.join(f.root, today(), "instrument", "edit.txt"), text("原始样品"));
+  await f.store.scan();
+  const row = f.db.prepare("SELECT id FROM reports").get();
+  assert.ok(row, "扫描后本地应有一份报告");
+
+  pending.push({ id: 11, reportId: row.id, edit: { sampleName: "更正后" } });
+  await until(() => { f.client.heartbeat(); return acks.length === 1; }, "edit should be acknowledged");
+  assert.deepEqual(acks[0].results, [{ id: 11, ok: true }]);
+  assert.equal(JSON.parse(f.db.prepare("SELECT json FROM reports WHERE id=?").get(row.id).json).sampleName, "更正后");
+  await until(() => batches.some((batch) => (batch.events || []).some((event) => event.report.sampleName === "更正后")), "edited report should be uploaded");
+  const uploaded = batches.flatMap((batch) => batch.events).filter((event) => event.report.sampleName === "更正后");
+  assert.equal(uploaded.length, 1);
+  assert.equal(uploaded[0].sequence, 2);
+
+  // 回执丢失时中心会重发同一条：再次应用 changed=false，不会多出版本。
+  await until(() => { f.client.heartbeat(); return acks.length === 2; }, "repeated edit should be acknowledged again");
+  assert.deepEqual(acks[1].results, [{ id: 11, ok: true }]);
+  await delay(50);
+  assert.equal(batches.flatMap((batch) => batch.events).filter((event) => event.report.sampleName === "更正后").length, 1);
+});

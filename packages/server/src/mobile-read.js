@@ -1,5 +1,5 @@
 import express from "express";
-import { reportColumns } from "@lizi/core";
+import { applyReportEdit, reportColumns } from "@lizi/core";
 import { httpError } from "./directories.js";
 
 // 只读接口：供同机的小程序后端（三强小工具）调用。
@@ -85,6 +85,65 @@ export function createMobileRead({ store, parseQuery }) {
       next(error);
     }
   });
+
+  // 更正排队：小程序后端经回环提交，中心只记录意图；设备下次心跳取走，在本地库生效，
+  // 再用既有上传链路回传新版本。中心始终不就地把镜像改成与设备不一致的状态。
+  router.post(
+    "/reports/:id/edit",
+    express.json({ limit: "8kb", strict: true }),
+    (req, res, next) => {
+      try {
+        // 信任边界与只读接口相同：端口只绑宿主回环，反代把 /api/read 对公网返回 404，
+        // 唯一调用方是同机的中转服务。这里不按来源地址过滤——容器看到的对端是网桥地址。
+        const id = req.params.id;
+        if (!/^[a-f0-9]{32}$/.test(id)) throw httpError(400, "报告标识无效");
+        const body = req.body;
+        if (!body || typeof body !== "object" || Array.isArray(body))
+          throw httpError(400, "请求体必须为 JSON 对象");
+        if (Object.keys(body).some((key) => key !== "sampleName" && key !== "measurement"))
+          throw httpError(400, "仅支持修改样品名称或单个测点");
+        const edit = {};
+        if (body.sampleName !== undefined) edit.sampleName = body.sampleName;
+        if (body.measurement !== undefined) edit.measurement = body.measurement;
+        if (!Object.keys(edit).length) throw httpError(400, "没有需要修改的内容");
+
+        const report = store.report(id);
+        const target = store.reportTarget(id);
+        if (!report || !target) throw httpError(404, "报告不存在或已删除");
+        // 设备端只认自己的报告标识；格式不符说明是历史或异常上报，直接拒绝而不是排队。
+        if (!/^[a-f0-9]{32}$/.test(target.reportId))
+          throw httpError(409, "这份报告不支持远程更正");
+        let next_;
+        try {
+          next_ = applyReportEdit(report, edit);
+        } catch (error) {
+          throw httpError(400, error.message);
+        }
+        if (!next_.changed) {
+          res.json({
+            queued: false,
+            changed: false,
+            pending: store.pendingEditCount(target.deviceId),
+            deviceState: store.device(target.deviceId)?.connectionState ?? null,
+          });
+          return;
+        }
+        const device = store.device(target.deviceId);
+        if (!device || device.registrationState !== "approved")
+          throw httpError(409, "所属设备未启用，暂时无法更正");
+        const pending = store.queueEdit(target.deviceId, target.reportId, edit);
+        res.json({
+          queued: true,
+          changed: true,
+          pending,
+          deviceId: target.deviceId,
+          deviceState: device.connectionState,
+        });
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   return router;
 }

@@ -211,8 +211,33 @@ export async function createCloud({ db, options = {} }) {
         authorize(req);
         updateHeartbeat.run(new Date().toISOString(), beat.pending, beat.oldestPendingAt, beat.lastError, beat.acquisitionError, beat.clientVersion, device.id);
       });
-      res.json({ protocolVersion: 1, deviceId: device.id, registrationState: "approved" });
+      res.json({
+        protocolVersion: 1,
+        deviceId: device.id,
+        registrationState: "approved",
+        // 小程序提交的更正随心跳下发；设备应用后回执，中心不直接改写镜像。
+        edits: store.pendingEdits(device.id),
+      });
       store.changed(currentRevision());
+    } catch (error) { next(error); }
+  });
+
+  machineRouter.post("/edits/ack", (req, res, next) => {
+    try {
+      const device = authorize(req);
+      const results = req.body?.results;
+      if (!Array.isArray(results) || results.length > 50) throw httpError(422, "更正回执格式无效");
+      for (const item of results) {
+        if (!object(item) || !Number.isInteger(item.id) || typeof item.ok !== "boolean") throw httpError(422, "更正回执格式无效");
+        if (item.error !== undefined && item.error !== null && (typeof item.error !== "string" || item.error.length > 200)) throw httpError(422, "更正回执格式无效");
+        if (item.sequence !== undefined && item.sequence !== null && (!Number.isInteger(item.sequence) || item.sequence < 1)) throw httpError(422, "更正回执格式无效");
+      }
+      transaction(db, () => {
+        authorize(req);
+        for (const item of results)
+          store.finishEdit(device.id, item.id, { ok: item.ok, error: item.error ?? null, sequence: item.sequence ?? null });
+      });
+      res.json({ protocolVersion: 1, deviceId: device.id, accepted: results.length });
     } catch (error) { next(error); }
   });
 

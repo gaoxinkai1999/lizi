@@ -4,7 +4,7 @@ Windows 后台采集、本地离线查看、局域网汇总、固定国内中心
 
 ## 日常使用
 
-1. 安装 `Lizi-Setup-3.1.7-x64.exe`，在本机桌面设置报告根目录，结构为 `根目录/YYYY-MM-DD/仪器子目录/*.txt`。
+1. 安装 `Lizi-Setup-3.1.8-x64.exe`，在本机桌面设置报告根目录，结构为 `根目录/YYYY-MM-DD/仪器子目录/*.txt`。
 2. 在“中心接入”选择仪器类型、填写简短编号（例如 `A01`）并保存。编号自动转为大写，支持 1–24 位字母、数字、短横线和下划线；不再填写服务器地址、UUID、上传令牌或启用开关。
 3. 中心地址固定为 **https://reports.abocidee.com**。管理员进入“仪器”批准接入，客户端自动上传。待批准、断网和停用期间仍保留本机报告与待传任务。
 4. 报告页以完整测量表格为主体。“当前班次”按北京时间选择：07:00–19:00 白班；19:00 至次日 07:00 夜班；凌晨 7 点前选择前一天夜班。手动查看历史时不会被定时器强行切回当天。
@@ -22,7 +22,9 @@ Windows 后台采集、本地离线查看、局域网汇总、固定国内中心
 - 改单个测点时，**最大/平均/最小自动重算**（平均按整点取整，与解析结果口径一致）；仪器自己给出的指标（硬度偏差、粒径、前 25% 平均值/偏差等）保持仪器原值，不做推测性重算。
 - **仪器原始 TXT 不被改写**：更正在索引里生效，原始文件仍是仪器输出。若该 TXT 之后被重新写入，重新索引会以文件内容为准覆盖更正。
 - 更正以新版本上传中心（同一报告 ID，`sequence+1`），中心的当前值被替换，历史版本留在云端版本表；中心不提供修改入口，也不会改写设备上报的内容。
-- 仅**本机桌面**可改：接口要求回环地址加本机管理令牌，局域网对端与中心网页都无法修改。对端（其它设备）的报告只能查看，不能改。
+- 仅**数据所在设备的桌面**可直接改：接口要求回环地址加本机管理令牌，局域网对端与中心网页都无法修改。对端（其它设备）的报告只能查看，不能改。
+- **小程序**是唯一的远程更正入口，且只对指定成员开放（中转侧 `users.can_edit` 白名单，默认关闭，用 `manage.py edit <openid> on` 开启）：报告详情里长按样品名或某个测点，弹出输入框提交，界面没有任何按钮或说明。提交只进中心队列（`cloud_edits`），设备下一次心跳（60 秒）取走后用上面完全相同的本地编辑路径生效，再以新版本回传中心；设备离线时排队保留，恢复后自动同步。
+- 远程更正不写中心镜像：中心只有在收到设备上报的新版本后才改变显示值，因此改动生效前看到的仍是旧值，这一点与仪器口径一致。
 - 本机报告也会带设备 ID 用于显示来源，所以界面用单独的对端标记（`remote`）区分只读行；3.1.5 曾错误地以设备 ID 判断，导致客户端上所有报告都不可编辑，3.1.6 已修正。
 
 ## 中心管理与断连
@@ -87,7 +89,7 @@ Windows 后台采集、本地离线查看、局域网汇总、固定国内中心
 对象存储桶保持私有（禁止匿名列举），仅上传对象单独设 `public-read`。发布需要本机环境变量 `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY`（COS 上传）与 `LIZI_CENTER_USER` / `LIZI_CENTER_PASSWORD`（中心管理员登录）；任何凭据都不写入仓库和配置：
 
 ```sh
-node scripts/publish-release.js --file release/Lizi-Setup-3.1.7-x64.exe --notes "本次更新说明"
+node scripts/publish-release.js --file release/Lizi-Setup-3.1.8-x64.exe --notes "本次更新说明"
 ```
 
 脚本签名（与 `sign-release.js` 同一实现）→ 上传 COS 并匿名校验可下载 → 上传中心 → 发布并把 `url` 指向对象存储；重复执行同一版本不会覆盖已发布记录。
@@ -99,7 +101,7 @@ node scripts/publish-release.js --file release/Lizi-Setup-3.1.7-x64.exe --notes 
 签名私钥仅在受保护的发布电脑保存，不进仓库、不上传中心。构建后签名：
 
 ```sh
-node scripts/sign-release.js --key <受保护的私钥路径> --file release/Lizi-Setup-3.1.7-x64.exe --notes "本次更新说明"
+node scripts/sign-release.js --key <受保护的私钥路径> --file release/Lizi-Setup-3.1.8-x64.exe --notes "本次更新说明"
 ```
 
 脚本生成 `.exe.release.json`，只包含可公开的清单和签名。恢复发布环境必须保留私钥；换钥需要先安全更新客户端信任的公钥，不能只更换服务器上的文件。
@@ -121,10 +123,10 @@ npm run dist:server
 
 `LIZI_MODE=client|server`，两个模式必须使用不同的 `LIZI_HOME`；开发同时启动设置不同 `LIZI_PORT`，不要占用已安装服务的 3210。固定中心 URL 与发布版本在 `packages/core/src/deployment.js`，不提供客户端 HTTP 修改入口。
 
-服务端分发包 `release/Lizi-Server-3.1.7.tar.gz` 包含预构建页面、源码、锁文件及 Docker 配置，不包含 Node 镜像、安装包、报告或凭据。Linux 解压后运行 `bash deploy/install-linux.sh`；默认容器只发布宿主回环 `127.0.0.1:13211`，非 root、只读根、命名卷 `lizi-server_reports` 持久保存 `/data`（数据库、仪器和 releases）。
+服务端分发包 `release/Lizi-Server-3.1.8.tar.gz` 包含预构建页面、源码、锁文件及 Docker 配置，不包含 Node 镜像、安装包、报告或凭据。Linux 解压后运行 `bash deploy/install-linux.sh`；默认容器只发布宿主回环 `127.0.0.1:13211`，非 root、只读根、命名卷 `lizi-server_reports` 持久保存 `/data`（数据库、仪器和 releases）。
 
-国内中心部署于 `workspace-cn-new`，独立发行目录 `/opt/lizi-center/releases/Lizi-Server-3.1.7`，HTTPS 入口 **https://reports.abocidee.com**。反代模板为 `deploy/reports.abocidee.com.conf`，使用该主机现有泛域名证书续期链。Compose 信任紧邻一跳代理；后端端口保持宿主回环，代理覆盖转发头。安装包上传使用 512 MiB 请求体上限与流式反代。旧 `sq.abocidee.com`、`lizi.abocidee.com` 和旧 FRP 未因本项目部署而停止或切换。
+国内中心部署于 `workspace-cn-new`，独立发行目录 `/opt/lizi-center/releases/Lizi-Server-3.1.8`，HTTPS 入口 **https://reports.abocidee.com**。反代模板为 `deploy/reports.abocidee.com.conf`，使用该主机现有泛域名证书续期链。Compose 信任紧邻一跳代理；后端端口保持宿主回环，代理覆盖转发头。安装包上传使用 512 MiB 请求体上限与流式反代。旧 `sq.abocidee.com`、`lizi.abocidee.com` 和旧 FRP 未因本项目部署而停止或切换。
 
 首次管理员初始化需要中心数据目录中的 `setup-token.txt`，仅通过受保护渠道读取，不写入日志或公开文档。中心管理界面必须使用 HTTPS。升级/回退前停止本项目服务并备份完整数据卷及发布目录，不能运行中只复制单独的 SQLite 主文件。客户端同样备份完整 `C:\ProgramData\Lizi` 和原始 TXT；验证独立恢复后再清理旧备份。
 
-验收记录保存在本机 `release/acceptance-3.1.7.json`。3.0 历史演练记录仍保留，不能用旧版本演练代替新版实际部署与更新验收。3.1.0 已撤回：实测发现 Windows 提权启动等待了整个安装进程树，导致向导已经启动却误报超时；3.1.1 改为只等待短暂的校验辅助进程，不覆盖旧版本文件。
+验收记录保存在本机 `release/acceptance-3.1.8.json`。3.0 历史演练记录仍保留，不能用旧版本演练代替新版实际部署与更新验收。3.1.0 已撤回：实测发现 Windows 提权启动等待了整个安装进程树，导致向导已经启动却误报超时；3.1.1 改为只等待短暂的校验辅助进程，不覆盖旧版本文件。

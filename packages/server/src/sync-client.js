@@ -110,6 +110,7 @@ class SyncClient extends EventEmitter {
     this.flight = null;
     this.enrollFlight = null;
     this.heartbeatFlight = null;
+    this.editsFlight = null;
     this.queueMetrics = { pending: null, oldestPendingAt: null, backfillPendingDays: null };
     this.onLocalStatus = () => this.emitStatus();
     this.onRevision = () => { this.emitStatus(); this.kick(); };
@@ -619,10 +620,46 @@ class SyncClient extends EventEmitter {
           }
           this.connected = true;
           this.emitStatus();
+          if (Array.isArray(response.body?.edits) && response.body.edits.length)
+            void this.applyEdits(response.body.edits);
         }
       }).catch(() => {
         if (!this.closed && generation === this.generation) { this.connected = false; this.emitStatus(); }
       }).finally(() => { this.heartbeatFlight = null; });
+  }
+
+  // 小程序提交的更正：在本地库生效（与桌面双击编辑同一路径），再回执中心。
+  // 回执丢失时中心会再次下发，重复应用是幂等的。
+  async applyEdits(edits) {
+    if (this.closed || this.editsFlight || !Array.isArray(edits) || !edits.length) return;
+    const generation = this.generation;
+    this.editsFlight = (async () => {
+      const results = [];
+      for (const item of edits.slice(0, 20)) {
+        const id = Number(item?.id);
+        const reportId = typeof item?.reportId === "string" ? item.reportId : "";
+        const edit = item?.edit;
+        if (!Number.isInteger(id) || !/^[a-f0-9]{32}$/.test(reportId) || !edit || typeof edit !== "object") continue;
+        try {
+          await this.localStore.editReport(reportId, edit);
+          results.push({ id, ok: true });
+        } catch (error) {
+          results.push({ id, ok: false, error: String(error?.message || "更正未生效").slice(0, 200) });
+        }
+      }
+      if (!results.length || this.closed || generation !== this.generation) return;
+      try {
+        await this.post("edits/ack", { protocolVersion: 1, deviceId: this.config.deviceId, results });
+      } catch {
+        /* 下一次心跳会再次下发同一批更正。 */
+      }
+      this.kick();
+    })().catch(() => {});
+    try {
+      await this.editsFlight;
+    } finally {
+      this.editsFlight = null;
+    }
   }
 
   async close() {
@@ -634,7 +671,7 @@ class SyncClient extends EventEmitter {
     this.localStore.off("revision", this.onRevision);
     this.localStore.off("status", this.onLocalStatus);
     for (const request of this.requests) request.destroy(new Error("client closed"));
-    await Promise.allSettled([this.flight, this.heartbeatFlight, this.enrollFlight]);
+    await Promise.allSettled([this.flight, this.heartbeatFlight, this.enrollFlight, this.editsFlight]);
   }
 }
 

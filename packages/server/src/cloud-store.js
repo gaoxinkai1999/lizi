@@ -104,6 +104,19 @@ export function initializeCloud(db) {
     CREATE INDEX IF NOT EXISTS cloud_devices_instrument ON cloud_devices(instrument_id,instrument_type);
     CREATE TABLE IF NOT EXISTS cloud_state (id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL);
     INSERT OR IGNORE INTO cloud_state VALUES(1,0);
+    -- 小程序发起的更正：中心只排队，设备下一次心跳取走并在本地生效，随后回传新版本。
+    CREATE TABLE IF NOT EXISTS cloud_edits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      device_id TEXT NOT NULL REFERENCES cloud_devices(id),
+      report_id TEXT NOT NULL,
+      edit TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending',
+      error TEXT,
+      applied_sequence INTEGER,
+      applied_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cloud_edits_pending ON cloud_edits(device_id,state);
   `);
   // Migrate 3.0 databases in place: added columns keep existing secrets and treat prior devices as approved.
   const columns = new Set(db.prepare("PRAGMA table_info(cloud_devices)").all().map((column) => column.name));
@@ -179,7 +192,46 @@ export class CloudStore extends EventEmitter {
     const row = this.db.prepare(`SELECT ${columns} ${joins} WHERE c.id=?`).get(id);
     return row ? reportRow(row) : undefined;
   }
+  // 更正要用设备本地报告标识：中心标识是 设备ID+报告ID 的散列，设备不认识。
+  reportTarget(id) {
+    this.assertOpen();
+    if (typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id)) throw httpError(400, "报告标识无效");
+    const row = this.db.prepare("SELECT device_id AS deviceId, report_id AS reportId FROM cloud_current WHERE id=?").get(id);
+    return row ? { deviceId: row.deviceId, reportId: row.reportId } : undefined;
+  }
   summary() { return summaryOf(this.devices()); }
+  // 更正队列：小程序只提交意图，设备下次心跳取走并在本地生效，随后由既有上传链路回传。
+  queueEdit(deviceId, reportId, edit) {
+    this.assertOpen();
+    const now = new Date().toISOString();
+    const cutoff = new Date(Date.now() - 7 * 86_400_000).toISOString();
+    this.db.prepare("DELETE FROM cloud_edits WHERE state<>'pending' AND created_at<?").run(cutoff);
+    this.db.prepare("INSERT INTO cloud_edits (device_id,report_id,edit,created_at,state) VALUES(?,?,?,?,'pending')")
+      .run(deviceId, reportId, JSON.stringify(edit), now);
+    return this.pendingEditCount(deviceId);
+  }
+  pendingEditCount(deviceId) {
+    return this.db.prepare("SELECT COUNT(*) AS n FROM cloud_edits WHERE device_id=? AND state='pending'").get(deviceId).n;
+  }
+  pendingEdits(deviceId, limit = 20) {
+    this.assertOpen();
+    return this.db
+      .prepare("SELECT id,report_id AS reportId,edit FROM cloud_edits WHERE device_id=? AND state='pending' ORDER BY id LIMIT ?")
+      .all(deviceId, limit)
+      .map((row) => ({ id: row.id, reportId: row.reportId, edit: JSON.parse(row.edit) }));
+  }
+  finishEdit(deviceId, id, { ok, error = null, sequence = null } = {}) {
+    this.db
+      .prepare("UPDATE cloud_edits SET state=?,error=?,applied_sequence=?,applied_at=? WHERE id=? AND device_id=? AND state='pending'")
+      .run(
+        ok ? "applied" : "failed",
+        error === null || error === undefined ? null : String(error).slice(0, 200),
+        Number.isInteger(sequence) ? sequence : null,
+        new Date().toISOString(),
+        id,
+        deviceId,
+      );
+  }
   deviceSnapshot() { return { revision: this.revision, devices: this.devices(), summary: this.summary() }; }
   // Bounded interval; emits only when a device connection state actually changed.
   refreshConnections(emit = true) {
