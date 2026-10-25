@@ -484,6 +484,23 @@ test("没有报告来源时各模式无需远端租约，保留本机ID及默认
   assert.equal(store.status().cache.clients, 0);
 });
 
+test("局域网状态心跳不推进数据版本，来源状态变化才刷新", async (t) => {
+  const { store, lan, write, index } = await fixture(t);
+  await write("local.txt", "1 local");
+  await index();
+  await ready(store);
+  const before = store.revision;
+  lan.emit("status");
+  lan.emit("status");
+  assert.equal(store.revision, before);
+  lan.connected = false;
+  lan.emit("status");
+  assert.equal(store.revision, before + 1);
+  lan.connected = true;
+  lan.emit("status");
+  assert.equal(store.revision, before + 2);
+});
+
 test("多个来源ID隔离、单源离线不丢其他数据、定向移除与导出租约释放", async (t) => {
   const { store, lan, write, index } = await fixture(t);
   await write("local.txt", "1 local");
@@ -501,6 +518,10 @@ test("多个来源ID隔离、单源离线不丢其他数据、定向移除与导
   const combined = await ready(store);
   assert.deepEqual(new Set(combined.reports.map((row) => row.sourceId)),
     new Set(["host-a", "collector-b", "collector-c", "collector-d"]));
+  // The UI allows corrections only on rows owned by this machine: local rows keep
+  // their device id for display but must not be flagged remote.
+  for (const row of combined.reports)
+    assert.equal(row.remote, row.sourceId === "host-a" ? undefined : true);
   assert.equal(new Set(combined.reports.map((row) => row.id)).size, 4);
   assert.equal(combined.reports.find((row) => row.sourceId === "collector-b").id, originalId);
   const snapshot = await store.exportSnapshot(query, { allSelected: true });

@@ -252,9 +252,10 @@ function focusEditor() {
   nextTick(() => target?.querySelector?.(".cell-editor")?.focus());
 }
 function startEdit(report, field, index, current, event) {
-  // Only this machine's own reports can be corrected: rows merged from a paired
-  // peer carry a source id and are read-only here.
-  if (!editableReports.value || !report?.id || report.sourceId) return;
+  // Corrections stay on the machine that owns the report. Rows merged from a
+  // paired peer are flagged remote (their id is a hash of peer and report), so
+  // they stay read-only here. Local rows also carry a sourceId for display.
+  if (!editableReports.value || !report?.id || report.remote) return;
   editError.value = "";
   editFocus = event?.currentTarget ?? null;
   editing.value = {

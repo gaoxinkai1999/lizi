@@ -69,6 +69,9 @@ export class FederatedReportStore extends EventEmitter {
     // idle pair no longer re-renders the report page on the periodic sweep.
     this.peerRevisions = new Map();
     this.remotePending = false;
+    // Heartbeats repeat the same peer states; only a real change may refresh the
+    // open report page.
+    this.sourceSignature = this.lanSignature();
     this.listeners = [
       [localStore, "revision", () => this.changed()],
       [localStore, "status", () => this.emit("status", this.status())],
@@ -95,7 +98,10 @@ export class FederatedReportStore extends EventEmitter {
             this.invalidate();
           }
           this.connected = connected;
-          this.changed();
+          const signature = this.lanSignature();
+          const sourcesChanged = signature !== this.sourceSignature;
+          this.sourceSignature = signature;
+          this.changed({ data: sourcesChanged });
         },
       ],
     ];
@@ -108,6 +114,17 @@ export class FederatedReportStore extends EventEmitter {
       if (this.remotePending) this.invalidate();
     }, 30000);
     this.maintenance.unref();
+  }
+
+  lanSignature() {
+    const status = this.lan.getStatus();
+    return [
+      status.connected ? "1" : "0",
+      ...(status.peers ?? []).map(
+        (peer) =>
+          `${peer.id}:${peer.connected ? 1 : 0}:${peer.canQuery ? 1 : 0}`,
+      ),
+    ].join("|");
   }
 
   peerChanged(info) {
@@ -222,10 +239,12 @@ export class FederatedReportStore extends EventEmitter {
     };
   }
 
-  changed() {
+  changed({ data = true } = {}) {
     if (this.closed) return;
-    this.revision += 1;
-    this.emit("revision", { revision: this.revision });
+    if (data) {
+      this.revision += 1;
+      this.emit("revision", { revision: this.revision });
+    }
     this.emit("status", this.status());
   }
 
@@ -395,7 +414,7 @@ export class FederatedReportStore extends EventEmitter {
         const id = createHash("sha256").update(`${peer.id}\0${report.id}`).digest("hex").slice(0, 32);
         if (ids.has(id)) throw httpError(502, "来源返回重复报告");
         ids.add(id);
-        const row = { ...report, id, sourceId: peer.id, sourceName: result.sourceName || peer.name };
+        const row = { ...report, id, remote: true, sourceId: peer.id, sourceName: result.sourceName || peer.name };
         // Payload plus bookkeeping: a cache budget, not exact V8 heap size.
         bytes += Buffer.byteLength(JSON.stringify(row)) + 128;
         if (bytes > this.maxRemoteBytes)
