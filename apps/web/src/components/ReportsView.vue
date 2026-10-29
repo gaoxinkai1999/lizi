@@ -6,6 +6,7 @@ import {
   Image,
   ClipboardCopy,
   FileSearch,
+  TriangleAlert,
 } from "lucide-vue-next";
 import { localDate, request, saveBlob, showValue } from "../api.js";
 import { currentShift } from "../../../../packages/core/src/current-shift.js";
@@ -28,24 +29,37 @@ const props = defineProps({
   scanStatus: Object,
   deploymentMode: String,
 });
+const server = computed(() => props.deploymentMode === "server");
+const productionShift = ref(currentShift());
 const clientId = crypto.randomUUID();
 function requestQuery(snapshot) {
   return { ...snapshot, clientId };
 }
 const emit = defineEmits(["query-changed"]);
-function chooseCurrentShift() {
+function updateProductionShift() {
   const current = currentShift();
+  if (productionShift.value.date !== current.date || productionShift.value.shift !== current.shift)
+    productionShift.value = current;
+}
+function chooseCurrentShift({ automatic = false } = {}) {
+  updateProductionShift();
+  const current = productionShift.value;
   const unchanged = query.date === current.date && query.shift === current.shift && query.page === 1;
   Object.assign(query, current, { page: 1 });
-  if (unchanged) loadReports();
+  if (unchanged && !automatic) loadReports();
+  if (!unchanged && automatic) notice.value = "收到新报告，已返回当前班次。";
+  return !unchanged;
 }
 const query = reactive({
-  date: props.initialQuery?.date || props.today || localDate(),
-  shift: props.initialQuery?.shift || "day",
-  excludeAggregate: Boolean(props.initialQuery?.excludeAggregate),
+  date: props.initialQuery?.date || (server.value ? props.today || localDate() : productionShift.value.date),
+  shift: props.initialQuery?.shift || (server.value ? "day" : productionShift.value.shift),
+  excludeAggregate: server.value && Boolean(props.initialQuery?.excludeAggregate),
   page: props.initialQuery?.page || 1,
   pageSize: 100,
 });
+const isCurrentShift = computed(() =>
+  query.date === productionShift.value.date && query.shift === productionShift.value.shift,
+);
 const reports = ref([]);
 const total = ref(0);
 const indexing = ref(false);
@@ -89,10 +103,21 @@ let controller,
   activeKey = "",
   sequence = 0,
   pendingRefresh = false,
+  pendingCurrentShift = false,
   reportFlight = null,
   renderedReports = "";
 const shiftNames = { day: "白班", night: "夜班", full: "完整班次" };
 const sourceStates = { local: "本机", ready: "最近在线", syncing: "待补传", offline: "离线", error: "上传异常", revoked: "已撤销", stale: "缓存已过期" };
+const offlineNotice = computed(() => {
+  if (!server.value) {
+    if (props.transientReports || transient.value)
+      return "已断线，仅显示最后获取的结果；Excel 导出需重新连接。";
+    return "离线查看缓存，Excel 导出需联网。";
+  }
+  if (props.transientReports || transient.value)
+    return "已断线，仅显示最后获取的结果；导出和图片需重新连接。";
+  return "离线查看缓存，Excel 需联网；图片需所需查询页均已缓存。";
+});
 const timeRange = computed(
   () =>
     ({
@@ -169,11 +194,13 @@ const testsCount = computed(() =>
     ...reports.value.map((report) => report.testResults?.length || 0),
   ),
 );
-const recordSheets = computed(() => buildRecordSheets(reports.value));
+const recordSheets = computed(() =>
+  server.value ? buildRecordSheets(reports.value) : [],
+);
 const activeSheet = computed(
   () => recordSheets.value[sheetIndex.value] ?? recordSheets.value[0] ?? null,
 );
-const recordMode = computed(() => viewMode.value === "record");
+const recordMode = computed(() => server.value && viewMode.value === "record");
 watch(recordSheets, (sheets) => {
   if (sheetIndex.value > sheets.length - 1) sheetIndex.value = 0;
 });
@@ -526,8 +553,20 @@ watch(
   { immediate: true },
 );
 watch(
-  () => [props.refreshKey, props.online],
-  () => {
+  () => [props.refreshKey, props.online, props.scanStatus?.reportCount, props.scanStatus?.reportDataRevision],
+  ([refreshKey, online, count, dataRevision], [previousKey, previousOnline, previousCount, previousDataRevision]) => {
+    // Acquisition has its own persistent marker; ordinary revisions also change
+    // for edits/deletions and LAN status. Older backends fall back to report count.
+    let added = false;
+    if (!server.value) {
+      if (Number.isSafeInteger(dataRevision))
+        added = Number.isSafeInteger(previousDataRevision) && dataRevision > previousDataRevision;
+      else
+        added = Number.isSafeInteger(count) && Number.isSafeInteger(previousCount) && count > previousCount;
+    }
+    if (added) pendingCurrentShift = true;
+    if (followPendingCurrentShift()) return;
+    if (refreshKey === previousKey && online === previousOnline && !added) return;
     if (props.active && document.visibilityState === "visible")
       loadReports({ silent: true });
     else pendingRefresh = true;
@@ -546,17 +585,34 @@ watch(
 watch(
   () => props.active,
   (active) => {
-    if (active && pendingRefresh) loadReports({ silent: true });
+    if (active) updateProductionShift();
+    if (active && !followPendingCurrentShift() && pendingRefresh)
+      loadReports({ silent: true });
     if (active) scheduleLease();
     else releaseLease();
   },
 );
+function followPendingCurrentShift() {
+  if (!pendingCurrentShift || !props.online || !props.active ||
+      document.visibilityState !== "visible" || editing.value ||
+      savingEdit.value || actionBusy.value)
+    return false;
+  pendingCurrentShift = false;
+  return chooseCurrentShift({ automatic: true });
+}
+watch([editing, savingEdit, actionBusy], followPendingCurrentShift);
 function resume() {
   if (document.visibilityState === "visible") {
+    updateProductionShift();
+    const changed = followPendingCurrentShift();
     scheduleLease();
-    if (props.active && pendingRefresh) loadReports({ silent: true });
+    if (props.active && pendingRefresh && !changed) loadReports({ silent: true });
   } else releaseLease();
 }
+const shiftTimer = setInterval(() => {
+  if (!server.value && props.active && document.visibilityState === "visible")
+    updateProductionShift();
+}, 30_000);
 document.addEventListener("visibilitychange", resume);
 window.addEventListener("pagehide", releaseLease);
 function toggle(id) {
@@ -564,8 +620,9 @@ function toggle(id) {
   const next = new Set(selected.value);
   if (next.has(id)) next.delete(id);
   else if (next.size >= 20_000) {
-    actionError.value =
-      "逐项选择最多 20000 份。导出整个班次请使用“选择整个班次”。";
+    actionError.value = server.value
+      ? "逐项选择最多 20000 份。导出整个班次请使用“选择整个班次”。"
+      : "逐项选择最多 20000 份，请先清除选择，再导出全部。";
     return;
   } else next.add(id);
   selected.value = next;
@@ -580,7 +637,9 @@ function toggleAll() {
     reports.value.forEach((report) => next.delete(report.id));
   else reports.value.forEach((report) => next.add(report.id));
   if (next.size > 20_000) {
-    actionError.value = "逐项选择最多 20000 份，请改用“选择整个班次”。";
+    actionError.value = server.value
+      ? "逐项选择最多 20000 份，请改用“选择整个班次”。"
+      : "逐项选择最多 20000 份，请先清除选择，再导出全部。";
     return;
   }
   selected.value = next;
@@ -716,7 +775,7 @@ async function* imageReports(snapshot, chosen, entire, signal) {
   if (!generated) throw new Error("排除总分析后没有可生成图片的报告。");
 }
 async function generateImages() {
-  if (!readyForActions.value || actionBusy.value) return;
+  if (!server.value || !readyForActions.value || actionBusy.value) return;
   actionBusy.value = "image";
   actionError.value = "";
   notice.value = "";
@@ -777,6 +836,7 @@ async function copyImage(image) {
 }
 onUnmounted(() => {
   sequence++;
+  clearInterval(shiftTimer);
   controller?.abort();
   imageController?.abort();
   exportController?.abort();
@@ -788,7 +848,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="reports-page reports-page--table-first">
+  <section class="reports-page reports-page--table-first"
+    :class="{ 'reports-page--history': !server && !isCurrentShift }">
     <h1 class="sr-only">强度报告</h1>
     <section class="query-panel" aria-label="报告筛选">
       <label class="date-field"
@@ -820,8 +881,17 @@ onUnmounted(() => {
         }}</span>
       </button>
     </section>
+    <div v-if="!server && !isCurrentShift" class="shift-warning" role="status">
+      <TriangleAlert :size="22" aria-hidden="true" />
+      <div>
+        <strong>非当前班次 · {{ query.date || "未选择日期" }} {{ query.shift === "full" ? "全天" : shiftNames[query.shift] }}</strong>
+        <span>当前班次：{{ productionShift.date }} {{ shiftNames[productionShift.shift] }}；新报告到达后自动返回。</span>
+      </div>
+      <button @click="chooseCurrentShift">返回当前班次</button>
+    </div>
     <div class="results-toolbar">
       <div class="result-count">
+        <span v-if="!server && isCurrentShift" class="current-shift-badge">当前班次</span>
         <strong>{{
           loadedQuery ? `${total} 份报告` : loading ? "查询中…" : "报告查询"
         }}</strong
@@ -832,7 +902,7 @@ onUnmounted(() => {
           <template v-else-if="cached"> · 缓存</template>
         </span>
       </div>
-      <div class="view-switch" role="group" aria-label="报告视图">
+      <div v-if="server" class="view-switch" role="group" aria-label="报告视图">
         <button
           :class="{ active: recordMode }"
           :aria-pressed="recordMode"
@@ -852,6 +922,9 @@ onUnmounted(() => {
         <input v-model="showDetails" type="checkbox" :disabled="!reports.length" />
         显示明细列（1–{{ testsCount }}）
       </label>
+      <button v-if="!server && hasSelection" class="text-button" @click="clearSelection">
+        清除选择
+      </button>
       <button
         class="primary"
         :disabled="!online || !readyForActions || !!actionBusy"
@@ -862,7 +935,7 @@ onUnmounted(() => {
         <template v-else>{{ hasSelection ? "导出选中 Excel" : "导出全部 Excel" }}</template>
       </button>
     </div>
-    <details class="report-options">
+    <details v-if="server" class="report-options">
       <summary>更多操作与信息</summary>
       <div class="report-options-content">
         <div class="button-row">
@@ -899,12 +972,6 @@ onUnmounted(() => {
           已检查 {{ scanStatus.scanProgress.visited }} 个文件 · 已入库
           {{ scanStatus.scanProgress.indexed }} 份 · 无效 {{ scanStatus.scanProgress.invalid }} 个
         </p>
-        <p v-if="online && deploymentMode !== 'server'" class="field-help">
-          报告根目录：{{ dataRoot || "尚未设置，请先在设置中选择报告根目录" }}
-          <template v-if="queryDirectories.length">
-            <br />查找日期目录：{{ queryDirectories.join("、") }}
-          </template>
-        </p>
       </div>
     </details>
     <details v-if="sourceWarnings.length" class="report-alert-summary">
@@ -923,10 +990,10 @@ onUnmounted(() => {
       </p>
     </details>
     <p v-if="!online" class="notice" role="status">
-      {{ transientReports || transient ? "已断线，仅显示最后获取的结果；导出和图片需重新连接。" : "离线查看缓存，Excel 需联网；图片需所需查询页均已缓存。" }}
+      {{ offlineNotice }}
     </p>
     <p v-if="!online && indexing" class="notice">
-      缓存数据尚未准备完成，可能不完整；请联网完成准备后再导出或生成图片。
+      缓存数据尚未准备完成，可能不完整；请联网完成准备后再导出{{ server ? "或生成图片" : "" }}。
     </p>
     <p v-if="error && reports.length" role="alert" class="error-message">
       更新未完成：{{ error }}。下方保留上次报告。
@@ -960,7 +1027,7 @@ onUnmounted(() => {
       <p v-if="online && deploymentMode !== 'server' && !dataRoot" class="field-help">
         请先在设置中选择报告根目录。
       </p>
-      <button @click="yesterday">查看昨日完整报告</button>
+      <button v-if="server" @click="yesterday">查看昨日完整报告</button>
     </div>
     <template v-else>
       <template v-if="recordMode && activeSheet">
@@ -1205,7 +1272,7 @@ onUnmounted(() => {
       <span>第 {{ query.page }} / {{ pageCount }} 页</span>
       <button :disabled="query.page >= pageCount" @click="query.page++">下一页</button>
     </div>
-    <p v-if="actionProgress" class="notice" role="status">
+    <p v-if="server && actionProgress" class="notice" role="status">
       {{ actionProgress }}
       <button @click="imageController?.abort()">取消生成</button>
     </p>
@@ -1222,7 +1289,7 @@ onUnmounted(() => {
       @close="detail = null"
       ><ReportDetail :report="detail"
     /></Modal>
-    <Modal v-if="imageOpen" title="报告图片" wide @close="imageOpen = false"
+    <Modal v-if="server && imageOpen" title="报告图片" wide @close="imageOpen = false"
       ><p class="muted">
         手机可长按图片保存。较多报告或测量值会分成多张，所有数据均保留。
       </p>

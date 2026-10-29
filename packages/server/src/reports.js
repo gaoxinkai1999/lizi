@@ -16,6 +16,7 @@ export class ReportStore extends EventEmitter {
     this.cachedStatus = {
       root: this.root,
       revision: this.revision,
+      reportDataRevision: Number(getSetting(db, "reportDataRevision", "0")),
       reportCount: 0,
       watching: false,
       scanning: false,

@@ -2294,6 +2294,54 @@ td:last-child {
   margin-bottom: 10px;
   border-radius: 9px;
 }
+.reports-page--history .query-panel {
+  border-color: #d5a04c;
+  background: #fffaf0;
+}
+.shift-warning {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 12px 14px;
+  border: 1px solid #d5a04c;
+  border-left: 4px solid #b77616;
+  border-radius: 9px;
+  background: #fff2d8;
+  color: #774b10;
+}
+.shift-warning > svg {
+  flex-shrink: 0;
+}
+.shift-warning > div {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  gap: 4px;
+}
+.shift-warning strong {
+  font-size: 14px;
+}
+.shift-warning span {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.shift-warning button {
+  flex-shrink: 0;
+  min-height: 36px;
+  padding: 6px 12px;
+  border-color: #b77616;
+  background: #b77616;
+  color: #fff;
+}
+.current-shift-badge {
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: #e6f3ef;
+  color: #246b5e;
+  font-size: 12px;
+  font-weight: 600;
+}
 .reports-page--table-first .date-field {
   width: auto;
   flex-direction: row;
@@ -2410,6 +2458,15 @@ td:last-child {
   margin: 8px 0;
 }
 @media (max-width: 700px) {
+  .shift-warning {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    padding: 10px;
+  }
+  .shift-warning button {
+    width: 100%;
+    min-height: 44px;
+  }
   .reports-page--table-first .query-panel {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 44px;

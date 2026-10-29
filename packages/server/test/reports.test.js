@@ -153,6 +153,37 @@ test("invalid report errors survive background scans until fixed or deleted", as
   assert.equal((await store.query(query)).total, 0);
 });
 
+test("acquired report markers distinguish new content from scans, edits and deletes", async (t) => {
+  const { root, store, db, policy } = await fixture(t);
+  const file = path.join(root, query.date, "instrument", "a.txt");
+  assert.equal(store.status().reportDataRevision, 0);
+  await stableWrite(file, report("2 A"));
+  const first = await settled(store);
+  const initial = store.status().reportDataRevision;
+  assert.ok(initial > 0);
+  await store.scan();
+  assert.equal(store.status().reportDataRevision, initial);
+  await store.editReport(first.reports[0].id, { sampleName: "3 corrected" });
+  assert.equal(store.status().reportDataRevision, initial, "local corrections are not acquisition");
+  await stableWrite(file, report("4 new content"));
+  await settled(store);
+  const updated = store.status().reportDataRevision;
+  assert.ok(updated > initial, "changed file content is new data even with the same report count");
+  assert.equal(store.status().reportCount, 1);
+  await fs.rm(file);
+  await settled(store);
+  assert.equal(store.status().reportCount, 0);
+  assert.equal(store.status().reportDataRevision, updated, "deletions do not trigger a return");
+  await store.close();
+  const restarted = new ReportStore(db, policy);
+  try {
+    await restarted.start();
+    assert.equal(restarted.status().reportDataRevision, updated, "the marker survives a backend restart");
+  } finally {
+    await restarted.close();
+  }
+});
+
 test("parser upgrade retries persisted invalid fingerprints without losing optional values", async (t) => {
   const { root, store, db } = await fixture(t, { selectRoot: false });
   const file = path.join(root, query.date, "instrument", "legacy.txt");

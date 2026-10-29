@@ -128,6 +128,7 @@ function removeReport(file, reportRoot) {
 function publish() {
   status.root = root;
   status.revision = revision;
+  status.reportDataRevision = Number(getSetting(db, "reportDataRevision", "0"));
   status.reportCount =
     db.prepare("SELECT count FROM report_counts WHERE root=?").get(root)
       ?.count ?? 0;
@@ -349,6 +350,7 @@ async function scanScope(scope, target) {
     }
     transaction(db, () => {
       let modifications = 0;
+      let acquired = 0;
       for (const item of batch) {
         if (item.unchanged) {
           markSeen.run(scanGeneration, item.file, scanRoot);
@@ -383,11 +385,16 @@ async function scanScope(scope, target) {
             );
             enqueueReport(db, item.id, item.json, scope.historical ?? false);
             modifications += 1;
+            acquired += 1;
           }
         } else {
           modifications += removeReport(item.file, scanRoot).changes;
         }
       }
+      // File acquisition is distinct from edits/deletions, and the marker stays
+      // monotonic across restarts even when the net report count does not grow.
+      if (acquired)
+        setSetting(db, "reportDataRevision", Number(getSetting(db, "reportDataRevision", "0")) + 1);
       changed(modifications);
     });
     batch = [];
