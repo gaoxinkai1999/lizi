@@ -501,6 +501,25 @@ test("局域网状态心跳不推进数据版本，来源状态变化才刷新",
   assert.equal(store.revision, before + 2);
 });
 
+test("unchanged remote retries retain cached generations and do not advance report revision", async (t) => {
+  const { store, lan, index } = await fixture(t);
+  await index();
+  lan.rows = [remote(1, "2 unchanged")];
+  await ready(store);
+  const scope = [...store.scopes.values()][0];
+  const generation = scope.sources.get("collector-b").generation;
+  const before = store.revision;
+  const calls = lan.calls.length;
+  lan.emit("change", { peerId: "collector-b", revision: 100 });
+  await until(async () => lan.calls.length > calls && !store.refreshing && !scope.loading, Boolean);
+  assert.equal(store.revision, before);
+  assert.equal(scope.sources.get("collector-b").generation, generation);
+  lan.rows = [remote(1, "2 changed")];
+  lan.emit("change", { peerId: "collector-b", revision: 101 });
+  assert.equal((await ready(store)).reports[0].sampleName, "2 changed");
+  assert.ok(store.revision > before);
+});
+
 test("多个来源ID隔离、单源离线不丢其他数据、定向移除与导出租约释放", async (t) => {
   const { store, lan, write, index } = await fixture(t);
   await write("local.txt", "1 local");

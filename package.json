@@ -1,6 +1,6 @@
 {
   "name": "lizi-workspace",
-  "version": "3.1.8",
+  "version": "3.1.9",
   "private": true,
   "type": "module",
   "description": "粒子多仪器采集与报告服务",
@@ -22,9 +22,14 @@
     "start:server": "node scripts/start-server.js",
     "build": "npm run build --workspace @lizi/web",
     "desktop": "npm run start --workspace @lizi/desktop",
-    "test": "node --test packages/core/test/*.test.js packages/server/test/*.test.js",
+    "test": "node --test packages/core/test/*.test.js packages/server/test/*.test.js apps/web/test/*.test.js",
     "prepare:resources": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Prepare-Resources.ps1",
     "dist:server": "npm run build && node scripts/package-server.js",
-    "dist": "npm run build && npm run prepare:resources && npm run dist --workspace @lizi/desktop"
+    "dist": "npm run build && npm run prepare:resources && npm run dist --workspace @lizi/desktop",
+    "version:check": "node scripts/version.js check",
+    "version:set": "node scripts/version.js set",
+    "pretest": "npm run version:check",
+    "prebuild": "npm run version:check",
+    "release": "node scripts/release.js"
   }
 }

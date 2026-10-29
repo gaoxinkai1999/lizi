@@ -100,15 +100,9 @@ function acceptStatus(value) {
     invalidateSession(new Event("lizi:data-root-changed"));
     return;
   }
-  const completed =
-    !value.scanning &&
-    (status.value?.scanning ||
-      (value.lastScan && value.lastScan !== status.value?.lastScan));
   status.value = value;
   statusError.value = "";
-  const oldRevision = revision;
   acceptRevision(value.revision);
-  if (completed && oldRevision === revision) refreshKey.value++;
 }
 async function refreshState() {
   if (statePending || invalidating || navigator.onLine === false) return;

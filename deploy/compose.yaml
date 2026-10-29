@@ -4,7 +4,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: lizi-server:3.1.8
+    image: lizi-server:3.1.9
     restart: unless-stopped
     init: true
     ports:

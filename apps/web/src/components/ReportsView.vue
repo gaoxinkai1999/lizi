@@ -78,9 +78,6 @@ const images = ref([]);
 const imageOpen = ref(false);
 const loadedQuery = ref(null);
 const loadedAt = ref("");
-// Revision of the currently rendered page: an unchanged revision means the
-// background refresh has nothing to redraw.
-const loadedRevision = ref(null);
 const pageCount = computed(() =>
   Math.max(1, Math.ceil(total.value / query.pageSize)),
 );
@@ -91,7 +88,9 @@ let controller,
   leaseScope = "",
   activeKey = "",
   sequence = 0,
-  pendingRefresh = false;
+  pendingRefresh = false,
+  reportFlight = null,
+  renderedReports = "";
 const shiftNames = { day: "白班", night: "夜班", full: "完整班次" };
 const sourceStates = { local: "本机", ready: "最近在线", syncing: "待补传", offline: "离线", error: "上传异常", revoked: "已撤销", stale: "缓存已过期" };
 const timeRange = computed(
@@ -322,19 +321,24 @@ const readyForActions = computed(() =>
   Boolean(loadedQuery.value && total.value > 0 && !indexing.value),
 );
 function displayResult(result, snapshot, savedAt, fromCache) {
-  reports.value = result.reports;
-  loadedRevision.value = result.revision ?? null;
+  const content = JSON.stringify(result.reports);
+  if (content !== renderedReports) {
+    renderedReports = content;
+    reports.value = result.reports;
+    if (detail.value)
+      detail.value =
+        result.reports.find((report) => report.id === detail.value.id) || null;
+  }
   transient.value = Boolean(props.transientReports || result.transient);
-  sources.value = result.sources || [];
-  sourceWarnings.value = result.warnings || [];
+  if (JSON.stringify(sources.value) !== JSON.stringify(result.sources || []))
+    sources.value = result.sources || [];
+  if (JSON.stringify(sourceWarnings.value) !== JSON.stringify(result.warnings || []))
+    sourceWarnings.value = result.warnings || [];
   total.value = result.total;
   indexing.value = Boolean(result.indexing);
   loadedQuery.value = snapshot;
   cached.value = fromCache;
   loadedAt.value = new Date(savedAt).toLocaleString("zh-CN");
-  if (detail.value)
-    detail.value =
-      result.reports.find((report) => report.id === detail.value.id) || null;
 }
 function leasePayload(snapshot, release = false) {
   return {
@@ -404,18 +408,19 @@ async function releaseLease() {
 async function loadReports({ silent = false } = {}) {
   const snapshot = { ...query };
   const key = pageKey(snapshot);
-  if (loading.value && activeKey === key) {
+  if (reportFlight !== null && activeKey === key) {
     pendingRefresh = true;
     return;
   }
   // A background refresh (revision change, reconnect, periodic status) must not
   // touch the visible state: no loading flag, no spinner, no "更新中" caption and
   // no clearing of the table, so nothing on screen blinks. Only a genuine data
-  // change (different revision) replaces the rows.
+  // change in this query's reports replaces the rows.
   const background = silent && Boolean(loadedQuery.value) && key === activeKey;
   if (key !== activeKey) {
     controller?.abort();
     reports.value = [];
+    renderedReports = "";
     loadedQuery.value = null;
     detail.value = null;
     loadedAt.value = "";
@@ -426,8 +431,10 @@ async function loadReports({ silent = false } = {}) {
   }
   activeKey = key;
   const current = ++sequence;
+  reportFlight = current;
   pendingRefresh = false;
   if (!snapshot.date) {
+    reportFlight = null;
     loading.value = false;
     error.value = "请选择报告日期。";
     return;
@@ -464,15 +471,6 @@ async function loadReports({ silent = false } = {}) {
       window.dispatchEvent(new Event("lizi:data-root-changed"));
       return;
     }
-    // Same revision means the same data: leave the rendered table untouched.
-    if (
-      background &&
-      loadedRevision.value !== null &&
-      result.revision === loadedRevision.value
-    ) {
-      loadedAt.value = new Date().toLocaleString("zh-CN");
-      return;
-    }
     displayResult(result, snapshot, Date.now(), false);
     scheduleLease();
     if (snapshot.page > pageCount.value && !result.indexing) {
@@ -486,6 +484,7 @@ async function loadReports({ silent = false } = {}) {
       error.value = cause.message;
   } finally {
     if (current === sequence) {
+      reportFlight = null;
       if (!background) loading.value = false;
       if (
         pendingRefresh &&
@@ -532,6 +531,16 @@ watch(
     if (props.active && document.visibilityState === "visible")
       loadReports({ silent: true });
     else pendingRefresh = true;
+  },
+);
+watch(
+  () => props.scanStatus?.scanning,
+  (scanning, previous) => {
+    if (!scanning && previous && indexing.value) {
+      if (props.active && document.visibilityState === "visible")
+        loadReports({ silent: true });
+      else pendingRefresh = true;
+    }
   },
 );
 watch(
@@ -904,7 +913,7 @@ onUnmounted(() => {
         <p v-for="warning in sourceWarnings" :key="warning">{{ warning }}</p>
       </div>
     </details>
-    <p v-if="online && (indexing || scanStatus?.scanning)" class="notice" role="status">
+    <p v-if="online && !reports.length && (indexing || scanStatus?.scanning)" class="notice" role="status">
       数据准备中，当前结果可能不完整。
     </p>
     <details v-if="online && scanErrors.length" class="report-alert-summary">

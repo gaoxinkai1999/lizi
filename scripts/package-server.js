@@ -8,6 +8,7 @@ const { version } = JSON.parse(await readFile(join(root, "package.json"), "utf8"
 const release = join(root, "release");
 const name = `Lizi-Server-${version}`;
 const staging = join(release, name);
+if (dirname(staging) !== release) throw new Error("Server staging must stay inside the release directory");
 await readFile(join(root, "apps/web/dist/index.html"));
 // This directory contains generated distribution files only.
 await rm(staging, { recursive: true, force: true });
@@ -17,8 +18,8 @@ for (const entry of [
   "packages/core/package.json", "packages/core/src",
   "packages/server/package.json", "packages/server/src",
   "apps/web/package.json", "apps/web/dist", "apps/desktop/package.json",
-  "deploy/Dockerfile", "deploy/compose.yaml", "deploy/install-linux.sh", "deploy/reports.abocidee.com.conf",
-  "scripts/start-server.js", "README.md",
+  "deploy/Dockerfile", "deploy/compose.yaml", "deploy/install-linux.sh", "deploy/release-center.sh", "deploy/reports.abocidee.com.conf",
+  "scripts/start-server.js", "scripts/version.js", "README.md",
 ]) {
   await mkdir(dirname(join(staging, entry)), { recursive: true });
   await cp(join(root, entry), join(staging, entry), { recursive: true });

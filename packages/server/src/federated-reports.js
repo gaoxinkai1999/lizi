@@ -349,13 +349,17 @@ export class FederatedReportStore extends EventEmitter {
       for (const scope of this.scopes.values()) {
         if (!scope.pending) continue;
         scope.pending = false;
+        let changed = false;
         for (const peer of this.peers()) {
           if (this.closed || this.scopes.get(scope.key) !== scope) break;
           if (!this.peers().some((entry) => entry.id === peer.id)) continue;
-          await this.refreshSource(scope, peer);
+          changed = await this.refreshSource(scope, peer) || changed;
         }
         scope.loading = scope.pending;
-        if (this.scopes.get(scope.key) === scope) this.changed();
+        const settledQuery = scope.reportedLoading && !scope.loading;
+        if (!scope.loading) scope.reportedLoading = false;
+        if (this.scopes.get(scope.key) === scope)
+          this.changed({ data: changed || Boolean(settledQuery) });
       }
     } finally {
       this.refreshing = false;
@@ -381,6 +385,7 @@ export class FederatedReportStore extends EventEmitter {
     const controller = new AbortController();
     source.controller = controller;
     let reserved = false;
+    let changed = false;
     try {
       if (!this.lan.getStatus().peers.find((entry) => entry.id === peer.id)?.connected)
         throw httpError(503, "设备离线，显示上次缓存的数据");
@@ -402,6 +407,7 @@ export class FederatedReportStore extends EventEmitter {
         throw httpError(409, "来源身份已变化，请重新查询");
       const { start, end } = shiftBounds(scope.query.date, scope.query.shift);
       const ids = new Set();
+      const hash = createHash("sha256");
       let bytes = 0;
       const rows = [];
       for (const report of result.reports) {
@@ -422,20 +428,32 @@ export class FederatedReportStore extends EventEmitter {
         rows.push(freezeReport(row));
       }
       rows.sort(compare);
-      const generation = { rows: Object.freeze(rows), bytes, refs: 1 };
-      this.unref(scope.merged);
-      scope.merged = null;
-      this.unref(source.generation);
-      source.generation = generation;
-      this.generations.add(generation);
-      source.warning = result.errors?.length ? "部分报告未完整读取，请检查来源索引状态" : null;
+      for (const row of rows) hash.update(JSON.stringify(row));
+      const fingerprint = hash.digest("hex");
+      if (fingerprint !== source.fingerprint) {
+        const generation = { rows: Object.freeze(rows), bytes, refs: 1 };
+        this.unref(scope.merged);
+        scope.merged = null;
+        this.unref(source.generation);
+        source.generation = generation;
+        source.fingerprint = fingerprint;
+        this.generations.add(generation);
+        changed = true;
+      }
+      const warning = result.errors?.length ? "部分报告未完整读取，请检查来源索引状态" : null;
+      changed = changed || source.warning !== warning;
+      source.warning = warning;
     } catch (error) {
-      if (this.scopes.get(scope.key) === scope && !controller.signal.aborted)
-        source.warning = error.message || "设备同步失败";
+      if (this.scopes.get(scope.key) === scope && !controller.signal.aborted) {
+        const warning = error.message || "设备同步失败";
+        changed = source.warning !== warning;
+        source.warning = warning;
+      }
     } finally {
       if (reserved) this.reservedBytes -= this.maxRemoteBytes;
       source.controller = null;
     }
+    return changed;
   }
 
   metadata(scope) {
@@ -552,6 +570,7 @@ export class FederatedReportStore extends EventEmitter {
         if (pageBytes > 24 * MiB)
           throw httpError(413, "本页明细过大，请减小每页报告数量");
       }
+      if (scope?.loading) scope.reportedLoading = true;
       return {
         ...page,
         reports,
